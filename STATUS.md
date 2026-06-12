@@ -52,8 +52,8 @@ Build a working, production-ready, submittable RAG-LLM chatbot and interactive c
 
 ### 🔹 Phase 4: FastAPI Gateway Foundations & Prompt Guardrails
 - [x] **Step 4.1:** ✅ (2026-06-12) Establish the global ASGI server framework (`main.py`) declaring endpoint routing channels for analytical data retrievals.
-- [ ] **Step 4.2:** Build `services/rag_service.py` using `ChatGoogleGenerativeAI` targeting the Gemini 2.5 extended configuration.
-- [ ] **Step 4.3:** Hardcode system prompt architectures enforcing the strict government safety boundary fallback and citation assembly logic.
+- [x] **Step 4.2:** ✅ (2026-06-12) Build `services/rag_service.py` using `ChatGoogleGenerativeAI` targeting the Gemini 2.5 extended configuration.
+- [x] **Step 4.3:** ✅ (2026-06-12) Hardcode system prompt architectures enforcing the strict government safety boundary fallback and citation assembly logic.
 
 ### 🔹 Phase 5: Production Streamlit Command Center Interface Assembly (`app.py`)
 - [ ] **Step 5.1:** Initiate a modern, wide-layout Streamlit application frame using localized CSS components for a high-fidelity visual design.
