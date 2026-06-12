@@ -1,0 +1,12 @@
+[theme]
+primaryColor = "#0A74B9"             # Trustworthy National Gov Blue
+backgroundColor = "#F8F9FA"          # Sterile, modern off-white canvas
+secondaryBackgroundColor = "#0F2537" # Deep Midnight Navy for navigation/sidebars
+textColor = "#1F2937"                # High-contrast charcoal slate text
+font = "sans serif"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
