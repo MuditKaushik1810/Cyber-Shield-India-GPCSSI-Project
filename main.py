@@ -8,6 +8,8 @@ ingestion pipeline through a versioned ``/api/v1`` router framework:
 * ``GET  /api/v1/analytics/horizons`` — rolling 24h/7d/30d/1y snapshot matrices.
 * ``POST /api/v1/ingest/text``        — raw threat text → Gemini 2.5 Flash extraction
   → concurrent relational inserts + ChromaDB chunk commits → extraction manifest.
+* ``POST /api/v1/rag/query``          — guarded RAG inference: dual-collection
+  retrieval → guardrail prompt → grounded, cited answer (or integrity fallback).
 
 A lifespan handler drives ``core.database.init_db()`` so both persistence
 tiers are physically validated before the gateway accepts traffic.
@@ -43,6 +45,7 @@ from services.analytics import (
 )
 from services.extractor import DownstreamExtractionController, ExtractionResult
 from services.ingestion import DocumentChunk, DocumentExtractionPipeline, MetadataValue
+from services.rag_service import get_rag_service
 
 # --------------------------------------------------------------------------- #
 # Unified gateway telemetry — daily-rotating channel: logs/gateway.log.       #
@@ -106,6 +109,29 @@ class IngestManifest(BaseModel):
     vector_ids: List[str] = Field(default_factory=list)
     extraction: ExtractionResult
     ingested_at: str
+
+
+class RagQueryRequest(BaseModel):
+    """Natural-language query entering the guarded RAG engine."""
+
+    query: str = Field(min_length=3, max_length=2000,
+                       description="The user's natural-language question.")
+    filters: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="Optional ChromaDB metadata filters "
+                    "(e.g. {'threat_category': 'apk_sideloading'}).")
+
+
+class RagQueryResponse(BaseModel):
+    """Structured guarded-inference envelope returned by the RAG service."""
+
+    answer: str
+    citations: List[Dict[str, object]] = Field(default_factory=list)
+    grounded: bool
+    fallback_reason: Optional[str] = None
+    chunks_retrieved: int = Field(ge=0)
+    query: str
+    generated_at: str
 
 
 # --------------------------------------------------------------------------- #
@@ -399,6 +425,28 @@ async def ingest_text(payload: IngestTextRequest) -> IngestManifest:
         manifest.advisories_inserted, manifest.chunks_committed,
     )
     return manifest
+
+
+@api_v1.post("/rag/query", response_model=RagQueryResponse,
+             summary="Guarded RAG inference over the official vector corpus")
+async def rag_query(payload: RagQueryRequest) -> RagQueryResponse:
+    """Dual-collection retrieval → guardrail prompt → grounded, cited answer.
+
+    The RAG service degrades internally to the mandated integrity fallback
+    on any retrieval, timeout, or LLM anomaly, so this route always returns
+    a structurally valid envelope; the global gateway handlers remain the
+    final safety net for unexpected runtime faults.
+    """
+    LOGGER.info("POST /rag/query chars=%d filters=%s",
+                len(payload.query), payload.filters or {})
+    envelope: Dict[str, object] = await get_rag_service().generate_response(
+        payload.query, payload.filters
+    )
+    response: RagQueryResponse = RagQueryResponse(**envelope)  # type: ignore[arg-type]
+    LOGGER.info("RAG envelope: grounded=%s citations=%d fallback=%s",
+                response.grounded, len(response.citations),
+                response.fallback_reason or "-")
+    return response
 
 
 app.include_router(api_v1)
