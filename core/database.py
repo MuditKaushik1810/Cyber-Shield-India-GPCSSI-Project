@@ -176,7 +176,8 @@ SCHEMA_DDL: Tuple[str, ...] = (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         entity_type TEXT    NOT NULL CHECK (entity_type IN
                         ('phone','upi_id','bank_account','imei','url',
-                         'email','app_package','ip_address','aadhaar_masked')),
+                         'email','app_package','ip_address','crypto_wallet',
+                         'aadhaar_masked')),
         value       TEXT    NOT NULL,
         risk_score  REAL    NOT NULL DEFAULT 0.0
                             CHECK (risk_score >= 0.0 AND risk_score <= 100.0),
