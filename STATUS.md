@@ -21,7 +21,7 @@ Build a working, production-ready, submittable RAG-LLM chatbot and interactive c
   ```
 - [x] **Step 1.2:** ✅ (2026-06-12) Generate `requirements.txt` containing exact, Python 3.13-compliant, verified packages (`fastapi`, `uvicorn`, `streamlit`, `langchain-google-genai`, `python-dotenv`, `chromadb`, `aiosqlite`, `httpx`, `beautifulsoup4`, `plotly`, `pandas`, `pydantic`).
 - [x] **Step 1.3:** ✅ (2026-06-12) Construct `.env` template configuration validating the `GOOGLE_API_KEY` environment target.
-- [ ] **Step 1.4:** Government Web Scraper Matrix (`utils/scraper.py`): Code fully async, user-agent rotating extraction modules pointing to:
+- [x] **Step 1.4:** ✅ (2026-06-12) Government Web Scraper Matrix (`utils/scraper.py`): Code fully async, user-agent rotating extraction modules pointing to:
   - MHA Cyberdost Portal: Continuous polling of trending alert feeds and public threat advisories.
   - DoT & Sanchar Saathi (TAFCOP/CEIR): Capture bulk connections disconnected for fraud, and device/IMEI blacklists.
   - TRAI: Monitor SMS spoofing registry definitions and Unsolicited Commercial Communications (UCC) headers.
