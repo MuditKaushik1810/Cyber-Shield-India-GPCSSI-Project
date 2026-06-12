@@ -35,8 +35,8 @@ Build a working, production-ready, submittable RAG-LLM chatbot and interactive c
 - [x] **Step 1.7:** ✅ (2026-06-12) Document Extraction Pipeline (`services/ingestion.py`): Create continuous data streaming parsers to segment dense government handbooks into clean arrays using `RecursiveCharacterTextSplitter` configured to an exact 800-token size and 100-token overlap framework.
 
 ### 🔹 Phase 2: Vector Engineering & Relational Schema Compilation
-- [ ] **Step 2.1:** Instantiate ChromaDB collection maps with complete architectural indexing parameters (`source`, `url`, `date_published`, `jurisdiction`, `threat_category`).
-- [ ] **Step 2.2:** Code explicit SQL migration definitions via `aiosqlite` establishing these real-world database tables:
+- [x] **Step 2.1:** ✅ (2026-06-12) Instantiate ChromaDB collection maps with complete architectural indexing parameters (`source`, `url`, `date_published`, `jurisdiction`, `threat_category`).
+- [x] **Step 2.2:** ✅ (2026-06-12) Code explicit SQL migration definitions via `aiosqlite` establishing these real-world database tables (plus core tracking tables: `incidents`, `entities`, `tactics`, `expert_advisories`):
   - `historical_ncrb_cases`: Schema covering [State, Year, Category, Incidents, Convictions, Chargesheet_Rate].
   - `i4c_financial_metrics`: Schema covering [Timestamp, Incurred_Loss, Prevented_Capital, Recovery_Ratio].
   - `demographic_risk_profiles`: Schema covering [Age_Group, Gender, Geographic_Tier, Occupation, Dominant_Modus_Operandi].
