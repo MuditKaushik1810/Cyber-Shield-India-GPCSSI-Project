@@ -30,7 +30,8 @@ import asyncio
 import logging
 import math
 import statistics
-from datetime import datetime, timezone
+import tempfile
+from datetime import datetime, timedelta, timezone
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -38,7 +39,7 @@ from typing import Dict, List, Optional, Tuple
 import aiosqlite
 from pydantic import BaseModel, Field
 
-from core.database import SQLITE_PATH
+from core.database import SQLITE_PATH, RelationalStoreManager
 
 # --------------------------------------------------------------------------- #
 # Forensic logging — dedicated daily-rotating channel: logs/analytics.log.    #
@@ -548,6 +549,195 @@ async def calculate_kcvi(
 
 
 # --------------------------------------------------------------------------- #
+# Step 3.3 — Time-Horizon Aggregation Workers.                                #
+# --------------------------------------------------------------------------- #
+
+# Rolling temporal intervals for the dashboard Interval Matrix.
+TIME_HORIZON_WINDOWS: Dict[str, timedelta] = {
+    "24h": timedelta(hours=24),
+    "7d": timedelta(days=7),
+    "30d": timedelta(days=30),
+    "1y": timedelta(days=365),
+}
+
+
+def _sqlite_timestamp(moment: datetime) -> str:
+    """Render a timezone-aware moment in SQLite's datetime('now') format."""
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+class HorizonSnapshot(BaseModel):
+    """One rolling-window snapshot of incident and entity dynamics."""
+
+    horizon: str
+    window_start: str
+    window_end: str
+    incident_volume: int = Field(ge=0)
+    previous_incident_volume: int = Field(ge=0)
+    volume_delta: int
+    vector_counts: Dict[str, int] = Field(default_factory=dict)
+    vector_momentum: Dict[str, int] = Field(
+        default_factory=dict,
+        description="Vector -> count change vs the previous equivalent window.",
+    )
+    gaining_vectors: List[str] = Field(
+        default_factory=list,
+        description="Vectors with positive momentum, strongest first.",
+    )
+    new_entity_count: int = Field(ge=0)
+    previous_new_entity_count: int = Field(ge=0)
+    entity_volatility_index: float = Field(
+        description="Relative change in new-indicator influx vs the previous "
+                    "window; absolute influx when the previous window was silent.",
+    )
+
+
+class TimeHorizonMatrix(BaseModel):
+    """The full four-interval snapshot matrix for dashboard consumption."""
+
+    snapshots: Dict[str, HorizonSnapshot] = Field(default_factory=dict)
+    generated_at: str
+
+
+def _compute_delta_kernel(
+    current_counts: Dict[str, int], previous_counts: Dict[str, int]
+) -> Tuple[Dict[str, int], List[str]]:
+    """Pure multi-window delta kernel (offloaded via asyncio.to_thread).
+
+    Returns the per-vector momentum table and the gaining vectors ordered
+    by strongest positive momentum (ties broken alphabetically).
+    """
+    momentum: Dict[str, int] = {}
+    for vector in set(current_counts) | set(previous_counts):
+        momentum[vector] = current_counts.get(vector, 0) - previous_counts.get(vector, 0)
+    gaining: List[str] = sorted(
+        (vector for vector, delta in momentum.items() if delta > 0),
+        key=lambda vector: (-momentum[vector], vector),
+    )
+    return momentum, gaining
+
+
+def _entity_volatility_index(current_new: int, previous_new: int) -> float:
+    """Rate-of-influx change for new threat indicators.
+
+    Relative change against the previous window; when the previous window
+    saw zero new indicators, the absolute current influx is returned so a
+    surge from silence registers proportionally to its size.
+    """
+    if previous_new == 0:
+        return float(current_new)
+    return round((current_new - previous_new) / previous_new, 2)
+
+
+async def _window_vector_counts(
+    connection: aiosqlite.Connection, start: str, end: str
+) -> Dict[str, int]:
+    """Grouped incident counts for one [start, end) window."""
+    cursor: aiosqlite.Cursor = await connection.execute(
+        "SELECT threat_category, COUNT(*) FROM incidents "
+        "WHERE created_at IS NOT NULL AND created_at >= ? AND created_at < ? "
+        "GROUP BY threat_category",
+        (start, end),
+    )
+    rows: List[Tuple[str, int]] = list(await cursor.fetchall())
+    return {row[0]: int(row[1]) for row in rows}
+
+
+async def _window_new_entity_count(
+    connection: aiosqlite.Connection, start: str, end: str
+) -> int:
+    """Count of indicators first seen inside one [start, end) window."""
+    cursor: aiosqlite.Cursor = await connection.execute(
+        "SELECT COUNT(*) FROM entities "
+        "WHERE first_seen IS NOT NULL AND first_seen >= ? AND first_seen < ?",
+        (start, end),
+    )
+    row: Tuple[int] = await cursor.fetchone()  # type: ignore[assignment]
+    return int(row[0])
+
+
+async def compute_time_horizons(
+    reference_time: Optional[datetime] = None,
+    database_path: Path = SQLITE_PATH,
+) -> TimeHorizonMatrix:
+    """Generate the rolling 24h/7d/30d/1y snapshot matrix.
+
+    Each horizon is compared against its previous equivalent window
+    ([now-2Δ, now-Δ)) to expose vector momentum and entity volatility.
+
+    Raises:
+        ValueError: If a supplied reference time lacks timezone awareness —
+            naive datetimes would silently corrupt every window boundary.
+    """
+    if reference_time is not None and reference_time.tzinfo is None:
+        raise ValueError(
+            "reference_time must be timezone-aware; naive datetimes would "
+            "misalign all window boundaries"
+        )
+    now: datetime = reference_time or datetime.now(timezone.utc)
+    now_stamp: str = _sqlite_timestamp(now)
+
+    snapshots: Dict[str, HorizonSnapshot] = {}
+    async with aiosqlite.connect(database_path) as connection:
+        for horizon, window in TIME_HORIZON_WINDOWS.items():
+            current_start: str = _sqlite_timestamp(now - window)
+            previous_start: str = _sqlite_timestamp(now - (2 * window))
+            try:
+                current_counts: Dict[str, int] = await _window_vector_counts(
+                    connection, current_start, now_stamp
+                )
+                previous_counts: Dict[str, int] = await _window_vector_counts(
+                    connection, previous_start, current_start
+                )
+                current_entities: int = await _window_new_entity_count(
+                    connection, current_start, now_stamp
+                )
+                previous_entities: int = await _window_new_entity_count(
+                    connection, previous_start, current_start
+                )
+            except aiosqlite.Error:
+                LOGGER.exception(
+                    "Time-horizon aggregation query failed for window %s", horizon
+                )
+                raise
+
+            momentum: Dict[str, int]
+            gaining: List[str]
+            momentum, gaining = await asyncio.to_thread(
+                _compute_delta_kernel, current_counts, previous_counts
+            )
+            incident_volume: int = sum(current_counts.values())
+            previous_volume: int = sum(previous_counts.values())
+            snapshots[horizon] = HorizonSnapshot(
+                horizon=horizon,
+                window_start=current_start,
+                window_end=now_stamp,
+                incident_volume=incident_volume,
+                previous_incident_volume=previous_volume,
+                volume_delta=incident_volume - previous_volume,
+                vector_counts=current_counts,
+                vector_momentum=momentum,
+                gaining_vectors=gaining,
+                new_entity_count=current_entities,
+                previous_new_entity_count=previous_entities,
+                entity_volatility_index=_entity_volatility_index(
+                    current_entities, previous_entities
+                ),
+            )
+            LOGGER.info(
+                "Horizon %s: volume=%d (Δ%+d) gaining=%s entities=%d (vol=%.2f)",
+                horizon, incident_volume, incident_volume - previous_volume,
+                ",".join(gaining) or "-", current_entities,
+                snapshots[horizon].entity_volatility_index,
+            )
+
+    return TimeHorizonMatrix(
+        snapshots=snapshots,
+        generated_at=now.isoformat(),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # In-module validation harness — mock high-threat 'Digital Arrest' campaign.  #
 # --------------------------------------------------------------------------- #
 
@@ -712,10 +902,143 @@ async def _run_kcvi_validation_harness() -> None:
     print("KCVI VALIDATION HARNESS: PASS")
 
 
+async def _seed_temporal_fixture(database_path: Path, now: datetime) -> None:
+    """Seed back-dated synthetic records spanning all four intervals."""
+    # (title, threat_category, age_hours) — ages chosen so each horizon's
+    # current AND previous window receives a known, distinct population.
+    incident_rows: List[Tuple[str, str, int]] = [
+        ("A1 fresh digital arrest case", "digital_arrest", 2),
+        ("A2 fresh digital arrest case", "digital_arrest", 5),
+        ("A3 fresh UPI mule chain", "payment_fraud", 10),
+        ("B1 prior-day digital arrest", "digital_arrest", 30),       # 24h-prev
+        ("C1 wedding invite APK wave", "apk_sideloading", 72),       # 3d
+        ("C2 courier APK wave", "apk_sideloading", 96),              # 4d
+        ("D1 trading app fraud", "investment_scam", 240),            # 7d-prev
+        ("E1 QR collect scam", "payment_fraud", 480),                # 20d
+        ("F1 misc cyber bulletin", "general_cyber", 1080),           # 30d-prev
+        ("G1 spoofed VoIP array", "voip_spoofing", 4800),            # 200d
+        ("H1 archived mule case", "payment_fraud", 9600),            # 1y-prev
+    ]
+    entity_rows: List[Tuple[str, str, int]] = [
+        ("upi_id", "fraud.verify1@okax", 1),
+        ("phone", "9000000001", 6),
+        ("upi_id", "fraud.verify2@okax", 30),                        # 24h-prev
+        ("url", "http://scam-invite.example", 120),                  # 5d
+        ("phone", "9000000002", 216),                                # 7d-prev
+        ("email", "mule.handler@scam.in", 600),                      # 25d
+        ("phone", "9000000003", 960),                                # 30d-prev
+        ("url", "http://archived-scam.example", 12000),              # 1y-prev
+    ]
+    async with aiosqlite.connect(database_path) as connection:
+        try:
+            await connection.executemany(
+                "INSERT INTO incidents "
+                "(title, source, threat_category, jurisdiction, created_at) "
+                "VALUES (?, 'temporal-harness', ?, 'National', ?)",
+                [
+                    (title, category,
+                     _sqlite_timestamp(now - timedelta(hours=age)))
+                    for title, category, age in incident_rows
+                ],
+            )
+            await connection.executemany(
+                "INSERT INTO entities "
+                "(entity_type, value, risk_score, first_seen, last_seen) "
+                "VALUES (?, ?, 50.0, ?, ?)",
+                [
+                    (entity_type, value,
+                     _sqlite_timestamp(now - timedelta(hours=age)),
+                     _sqlite_timestamp(now - timedelta(hours=age)))
+                    for entity_type, value, age in entity_rows
+                ],
+            )
+            await connection.commit()
+        except aiosqlite.Error:
+            await connection.rollback()
+            LOGGER.exception("Temporal fixture seeding failed — rolled back")
+            raise
+
+
+async def _run_time_horizon_validation_harness() -> None:
+    """Prove window isolation, delta tracking, and leak-free aggregation."""
+    now: datetime = datetime.now(timezone.utc)
+    with tempfile.TemporaryDirectory(prefix="cybershield-horizon-") as scratch:
+        scratch_db: Path = Path(scratch) / "horizon_fixture.sqlite3"
+        await RelationalStoreManager(scratch_db).init_schema()
+        await _seed_temporal_fixture(scratch_db, now)
+        matrix: TimeHorizonMatrix = await compute_time_horizons(
+            reference_time=now, database_path=scratch_db
+        )
+
+    assert set(matrix.snapshots) == set(TIME_HORIZON_WINDOWS), (
+        "matrix must carry exactly the four configured horizons"
+    )
+
+    # Exact window populations — any drift indicates a calculation leak.
+    expected_volumes: Dict[str, Tuple[int, int]] = {
+        "24h": (3, 1),   # (current, previous-equivalent)
+        "7d": (6, 1),
+        "30d": (8, 1),
+        "1y": (10, 1),
+    }
+    expected_entities: Dict[str, Tuple[int, int, float]] = {
+        "24h": (2, 1, 1.0),
+        "7d": (4, 1, 3.0),
+        "30d": (6, 1, 5.0),
+        "1y": (7, 1, 6.0),
+    }
+    for horizon, (volume, previous) in expected_volumes.items():
+        snapshot: HorizonSnapshot = matrix.snapshots[horizon]
+        assert snapshot.incident_volume == volume, (
+            f"{horizon}: expected {volume} incidents, got {snapshot.incident_volume}"
+        )
+        assert snapshot.previous_incident_volume == previous
+        assert snapshot.volume_delta == volume - previous
+        assert sum(snapshot.vector_counts.values()) == volume, (
+            f"{horizon}: vector counts must reconcile with total volume"
+        )
+        entity_new, entity_prev, volatility = expected_entities[horizon]
+        assert snapshot.new_entity_count == entity_new
+        assert snapshot.previous_new_entity_count == entity_prev
+        assert snapshot.entity_volatility_index == volatility
+
+    # Momentum tracking: 7d window must surface the freshest gaining vectors
+    # and never list a receding one.
+    week: HorizonSnapshot = matrix.snapshots["7d"]
+    assert week.vector_momentum["digital_arrest"] == 3
+    assert week.vector_momentum["apk_sideloading"] == 2
+    assert week.vector_momentum["investment_scam"] == -1
+    assert week.gaining_vectors[0] == "digital_arrest"
+    assert "apk_sideloading" in week.gaining_vectors
+    assert "investment_scam" not in week.gaining_vectors
+
+    # Boundary isolation: the 30-hour record must not leak into 24h-current.
+    day: HorizonSnapshot = matrix.snapshots["24h"]
+    assert day.vector_counts.get("digital_arrest") == 2
+    assert day.vector_momentum["digital_arrest"] == 1
+
+    # Missing date bounds: naive reference times must be rejected loudly.
+    try:
+        await compute_time_horizons(reference_time=datetime.now())
+        raise AssertionError("naive reference_time must raise ValueError")
+    except ValueError:
+        pass
+
+    print("--- Time-horizon matrix ---")
+    for horizon in TIME_HORIZON_WINDOWS:
+        snap: HorizonSnapshot = matrix.snapshots[horizon]
+        print(f"{horizon:>3}: volume={snap.incident_volume:>2} (Δ{snap.volume_delta:+d}) "
+              f"entities={snap.new_entity_count} "
+              f"volatility={snap.entity_volatility_index:+.2f} "
+              f"gaining={snap.gaining_vectors or '-'}")
+    print("TIME-HORIZON VALIDATION HARNESS: PASS")
+
+
 async def _run_all_harnesses() -> None:
-    """Execute the MAVI and KCVI validation harnesses sequentially."""
+    """Execute the MAVI, KCVI, and time-horizon harnesses sequentially."""
     await _run_validation_harness()
     await _run_kcvi_validation_harness()
+    await _run_time_horizon_validation_harness()
 
 
 if __name__ == "__main__":
