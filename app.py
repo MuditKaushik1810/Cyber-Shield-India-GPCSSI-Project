@@ -9,7 +9,7 @@ Wide-layout operational terminal consuming the live FastAPI gateway at
   calls → color-coded KPI blocks, delivery-vector charts, SPOF callout,
   and the rolling Interval Matrix — with a cross-tab hook piping vector
   telemetry into the RAG interrogation buffer (ledger Step 5.4).
-* **Tab 3 — AI Shield Chat**: plain-language grounded queries →
+* **Tab 3 — Semantic Knowledge Explorer**: deep semantic research queries →
   ``POST /api/v1/rag/query`` → cited answers, with the mandated official
   safety fallback rendered verbatim when a query is intercepted.
 
@@ -85,7 +85,7 @@ HORIZON_LABELS: Dict[str, str] = {
     "24h": "Past 24 Hours",
     "7d": "Past 7 Days",
     "30d": "Past 30 Days",
-    "1y": "Past 1 Year",
+    "1y": "Past Year",
 }
 
 
@@ -191,6 +191,10 @@ TERMINAL_CSS: str = """
     color: #7FA8C9; font-size: 0.72rem; letter-spacing: 0.22em;
     margin: 4px 0 0 0; text-transform: uppercase;
 }
+.cs-header .desc {
+    color: #B9CFE0; font-size: 0.82rem; letter-spacing: 0.02em;
+    margin: 10px 0 0 0; text-transform: none; font-style: italic;
+}
 .cs-kpi {
     border: 1px solid #E5E7EB; border-radius: 8px; padding: 16px 20px;
     background: #FFFFFF; text-align: center;
@@ -241,9 +245,12 @@ def render_header(online: bool) -> None:
         f"""
         <div class="cs-header">
           <h1>🛡️ Cyber Shield India</h1>
-          <p>National Cybercrime Triage &amp; Incident Console &nbsp;·&nbsp;
+          <p>Unified Cybercrime Research Conspectus &amp; Trend Repository &nbsp;·&nbsp;
              <span style="color:{status_color};">●</span> {status_text}
              &nbsp;·&nbsp; {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M UTC')}</p>
+          <p class="desc">A centralized repository aggregating distributed public
+             cyber advisories, safety matrices, and threat data into a single
+             open-access hub for scholars, students, and trend researchers.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -345,7 +352,7 @@ def _render_mavi_block(mavi: Dict[str, object]) -> None:
         st.markdown(
             f"""
             <div class="cs-kpi">
-              <div class="label">Threat Severity Index</div>
+              <div class="label">National Cyber Risk Index</div>
               <div class="value" style="color:{color};">{score:.2f}</div>
               <span class="cs-flag" style="background:{color};">{level}</span>
             </div>
@@ -353,7 +360,7 @@ def _render_mavi_block(mavi: Dict[str, object]) -> None:
             unsafe_allow_html=True,
         )
     with right:
-        st.metric("Trend Volatility", f"{variance:.2f}")
+        st.metric("Trend Volatility Indicator", f"{variance:.2f}")
         if flags:
             chips: str = "".join(
                 f'<span class="cs-flag" style="background:#0F2537;">{flag}</span>'
@@ -381,9 +388,9 @@ def _render_kcvi_block(kcvi: Dict[str, object]) -> None:
         LOGGER.exception("Malformed KCVI payload")
         st.error("KCVI payload malformed — see logs/frontend.log.")
         return
-    st.markdown(f"**Primary Attack Method:** "
+    st.markdown(f"**Prevalent Scam Architecture:** "
                 f"<span class='cs-flag' style='background:#DC2626;'>{spof}</span> "
-                f"&nbsp; Exploitation Rating **{index:.2f}**",
+                f"&nbsp; Public Exposure Rating **{index:.2f}**",
                 unsafe_allow_html=True)
     if not distribution:
         st.info("No delivery-vector telemetry recorded yet.")
@@ -397,7 +404,7 @@ def _render_kcvi_block(kcvi: Dict[str, object]) -> None:
             marker={"color": "#0A74B9"},
         ))
         vector_figure.update_layout(
-            title="Scam Distribution Chart", height=320,
+            title="Distribution of Emerging Scam Types", height=320,
             margin={"l": 10, "r": 10, "t": 40, "b": 10},
         )
         st.plotly_chart(vector_figure, use_container_width=True)
@@ -409,7 +416,7 @@ def _render_kcvi_block(kcvi: Dict[str, object]) -> None:
             marker={"color": "#0F2537"},
         ))
         stage_figure.update_layout(
-            title="Fraud Operational Phase", height=320,
+            title="Scam Infiltration Points", height=320,
             margin={"l": 10, "r": 10, "t": 40, "b": 10},
         )
         st.plotly_chart(stage_figure, use_container_width=True)
@@ -417,19 +424,20 @@ def _render_kcvi_block(kcvi: Dict[str, object]) -> None:
     # Cross-tab RAG injection hook (ledger Step 5.4): pipe the selected
     # vector's telemetry into the Tab 3 interrogation buffer.
     hook_vector: str = st.selectbox(
-        "Select a scam method to investigate", sorted(distribution),
+        "Select a scam type to research", sorted(distribution),
     )
-    if st.button("🔍 Investigate with AI Shield Chat"):
+    if st.button("🔍 Query Centralized Repository"):
         share: float = distribution.get(hook_vector, 0.0)
         st.session_state["rag_prefill"] = (
-            f"Telemetry context: vector={hook_vector}, "
-            f"share={share:.1%}, spof={spof}. "
-            f"What official protocols address {hook_vector.replace('_', ' ')} "
-            f"campaigns and how should investigators respond?"
+            f"Repository context: scam type={hook_vector}, "
+            f"share={share:.1%}, prevalent architecture={spof}. "
+            f"What do the aggregated public advisories say about "
+            f"{hook_vector.replace('_', ' ')} campaigns, and what safety "
+            f"protocols do official sources recommend?"
         )
         LOGGER.info("Cross-tab hook armed for vector=%s", hook_vector)
-        st.success("Case context loaded — open the AI Shield Chat tab to "
-                   "continue the investigation.")
+        st.success("Research context loaded — open the Semantic Knowledge "
+                   "Explorer tab to run the query.")
 
 
 def _render_horizon_block(horizons: Dict[str, object]) -> None:
@@ -477,7 +485,7 @@ def render_analytics_tab(online: bool) -> None:
     st.divider()
     _render_kcvi_block(kcvi)
     st.divider()
-    st.markdown("**Incident Tracking Timeline**")
+    st.markdown("**Aggregated Incident Trends**")
     _render_horizon_block(horizons)
 
 
@@ -504,7 +512,12 @@ def _render_citations(citations: List[Dict[str, object]]) -> None:
 
 def render_rag_tab(online: bool) -> None:
     """Interactive grounded search against the official vector corpus."""
-    st.subheader("AI Shield Chat — Grounded Intelligence")
+    st.subheader("Semantic Knowledge Explorer")
+    st.caption(
+        "Ask deep semantic research questions across our centralized "
+        "repository of scraped multi-agency advisories (e.g., 'How have "
+        "digital arrest fraud methodologies evolved over the past quarter?')."
+    )
     if not online:
         render_offline_banner()
         return
@@ -512,11 +525,12 @@ def render_rag_tab(online: bool) -> None:
         st.session_state["chat_history"] = []
     prefill: str = str(st.session_state.pop("rag_prefill", ""))
     query: str = st.text_input(
-        "Ask AI Shield Chat",
+        "Semantic research query",
         value=prefill,
-        placeholder="e.g. How do fake wedding invite APK scams operate?",
+        placeholder=("e.g. How have digital arrest fraud methodologies "
+                     "evolved over the past quarter?"),
     )
-    if st.button("🔍 Interrogate", type="primary") and query.strip():
+    if st.button("🔍 Run Semantic Query", type="primary") and query.strip():
         with st.spinner("Retrieving official grounding and generating…"):
             envelope, error = api_post(
                 "/rag/query", {"query": query.strip()}, timeout=120.0
@@ -528,7 +542,7 @@ def render_rag_tab(online: bool) -> None:
     history: List[Dict[str, object]] = st.session_state["chat_history"]
     for envelope in reversed(history):
         try:
-            st.markdown(f"**🧑‍✈️ Query:** {envelope.get('query', '')}")
+            st.markdown(f"**🧑‍🎓 Research query:** {envelope.get('query', '')}")
             answer: str = str(envelope.get("answer", ""))
             grounded: bool = bool(envelope.get("grounded", False))
             if grounded:
@@ -573,7 +587,7 @@ def main() -> None:
     triage_tab, analytics_tab, rag_tab = st.tabs([
         "🛡️ Incident Triage & Live Ingest",
         "📊 Advanced Math Analytics",
-        "🔎 AI Shield Chat",
+        "🔎 Semantic Knowledge Explorer",
     ])
     with triage_tab:
         render_ingest_tab(online)
