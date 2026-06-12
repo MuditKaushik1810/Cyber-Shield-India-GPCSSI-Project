@@ -41,7 +41,7 @@ Build a working, production-ready, submittable RAG-LLM chatbot and interactive c
   - `i4c_financial_metrics`: Schema covering [Timestamp, Incurred_Loss, Prevented_Capital, Recovery_Ratio].
   - `demographic_risk_profiles`: Schema covering [Age_Group, Gender, Geographic_Tier, Occupation, Dominant_Modus_Operandi].
   - `apprehension_ledger`: Schema covering [Arrest_ID, Date, State, Enforcement_Unit, Criminals_Caught, Scam_Type].
-- [ ] **Step 2.3:** Downstream Extraction Controller: Write zero-shot structured Pydantic models paired with Gemini 2.5 Flash to automatically process raw, unstructured news and expert feeds into clean, database-insertable JSON blocks.
+- [x] **Step 2.3:** ✅ (2026-06-12) Downstream Extraction Controller: Write zero-shot structured Pydantic models paired with Gemini 2.5 Flash to automatically process raw, unstructured news and expert feeds into clean, database-insertable JSON blocks.
 
 ### 🔹 Phase 3: Analytical Engine Execution & Multi-Interval Triage Processing
 - [ ] **Step 3.1:** Code the mathematical processor for Mule Account Velocity Index (MAVI) inside `services/analytics.py` to identify operational money mule hotspots.
