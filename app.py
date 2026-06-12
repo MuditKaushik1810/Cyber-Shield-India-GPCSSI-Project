@@ -9,7 +9,7 @@ Wide-layout operational terminal consuming the live FastAPI gateway at
   calls → color-coded KPI blocks, delivery-vector charts, SPOF callout,
   and the rolling Interval Matrix — with a cross-tab hook piping vector
   telemetry into the RAG interrogation buffer (ledger Step 5.4).
-* **Tab 3 — Grounded Intelligence RAG Chat**: plain-language queries →
+* **Tab 3 — AI Shield Chat**: plain-language grounded queries →
   ``POST /api/v1/rag/query`` → cited answers, with the mandated official
   safety fallback rendered verbatim when a query is intercepted.
 
@@ -78,6 +78,14 @@ THREAT_LEVEL_COLORS: Dict[str, str] = {
     "ELEVATED": "#EA580C",
     "GUARDED": "#D97706",
     "LOW": "#059669",
+}
+
+# Plain-English display labels for the rolling API horizon keys.
+HORIZON_LABELS: Dict[str, str] = {
+    "24h": "Past 24 Hours",
+    "7d": "Past 7 Days",
+    "30d": "Past 30 Days",
+    "1y": "Past 1 Year",
 }
 
 
@@ -205,6 +213,22 @@ TERMINAL_CSS: str = """
     border-radius: 6px; padding: 14px 20px; background: #FEF2F2;
     color: #991B1B; font-weight: 600; letter-spacing: 0.04em;
 }
+/* Contrast patch: the navy secondaryBackgroundColor theme value darkens
+   input fields, leaving charcoal theme text invisible while typing. Force
+   crisp light fields with high-contrast text and a visible caret. */
+.stTextInput input, .stTextArea textarea {
+    background-color: #FFFFFF !important;
+    color: #1F2937 !important;
+    caret-color: #0A74B9 !important;
+    border: 1px solid #CBD5E1 !important;
+}
+.stTextInput input::placeholder, .stTextArea textarea::placeholder {
+    color: #9CA3AF !important;
+}
+div[data-baseweb="select"] > div {
+    background-color: #FFFFFF !important;
+    color: #1F2937 !important;
+}
 </style>
 """
 
@@ -216,8 +240,8 @@ def render_header(online: bool) -> None:
     st.markdown(
         f"""
         <div class="cs-header">
-          <h1>🛡️ Cyber Shield India — Threat Intelligence Grid</h1>
-          <p>National Cybercrime Operational Terminal &nbsp;·&nbsp;
+          <h1>🛡️ Cyber Shield India</h1>
+          <p>National Cybercrime Triage &amp; Incident Console &nbsp;·&nbsp;
              <span style="color:{status_color};">●</span> {status_text}
              &nbsp;·&nbsp; {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M UTC')}</p>
         </div>
@@ -321,7 +345,7 @@ def _render_mavi_block(mavi: Dict[str, object]) -> None:
         st.markdown(
             f"""
             <div class="cs-kpi">
-              <div class="label">Composite MAVI Score</div>
+              <div class="label">Threat Severity Index</div>
               <div class="value" style="color:{color};">{score:.2f}</div>
               <span class="cs-flag" style="background:{color};">{level}</span>
             </div>
@@ -329,7 +353,7 @@ def _render_mavi_block(mavi: Dict[str, object]) -> None:
             unsafe_allow_html=True,
         )
     with right:
-        st.metric("Population variance", f"{variance:.2f}")
+        st.metric("Trend Volatility", f"{variance:.2f}")
         if flags:
             chips: str = "".join(
                 f'<span class="cs-flag" style="background:#0F2537;">{flag}</span>'
@@ -357,9 +381,9 @@ def _render_kcvi_block(kcvi: Dict[str, object]) -> None:
         LOGGER.exception("Malformed KCVI payload")
         st.error("KCVI payload malformed — see logs/frontend.log.")
         return
-    st.markdown(f"**Single Point of Failure:** "
+    st.markdown(f"**Primary Attack Method:** "
                 f"<span class='cs-flag' style='background:#DC2626;'>{spof}</span> "
-                f"&nbsp; Vulnerability index **{index:.2f}**",
+                f"&nbsp; Exploitation Rating **{index:.2f}**",
                 unsafe_allow_html=True)
     if not distribution:
         st.info("No delivery-vector telemetry recorded yet.")
@@ -373,7 +397,7 @@ def _render_kcvi_block(kcvi: Dict[str, object]) -> None:
             marker={"color": "#0A74B9"},
         ))
         vector_figure.update_layout(
-            title="Delivery vector share (%)", height=320,
+            title="Scam Distribution Chart", height=320,
             margin={"l": 10, "r": 10, "t": 40, "b": 10},
         )
         st.plotly_chart(vector_figure, use_container_width=True)
@@ -385,7 +409,7 @@ def _render_kcvi_block(kcvi: Dict[str, object]) -> None:
             marker={"color": "#0F2537"},
         ))
         stage_figure.update_layout(
-            title="Kill chain stage concentration (%)", height=320,
+            title="Fraud Operational Phase", height=320,
             margin={"l": 10, "r": 10, "t": 40, "b": 10},
         )
         st.plotly_chart(stage_figure, use_container_width=True)
@@ -393,9 +417,9 @@ def _render_kcvi_block(kcvi: Dict[str, object]) -> None:
     # Cross-tab RAG injection hook (ledger Step 5.4): pipe the selected
     # vector's telemetry into the Tab 3 interrogation buffer.
     hook_vector: str = st.selectbox(
-        "Interrogate a delivery vector", sorted(distribution),
+        "Select a scam method to investigate", sorted(distribution),
     )
-    if st.button("🔁 Pipe telemetry into RAG interrogation"):
+    if st.button("🔍 Investigate with AI Shield Chat"):
         share: float = distribution.get(hook_vector, 0.0)
         st.session_state["rag_prefill"] = (
             f"Telemetry context: vector={hook_vector}, "
@@ -404,7 +428,8 @@ def _render_kcvi_block(kcvi: Dict[str, object]) -> None:
             f"campaigns and how should investigators respond?"
         )
         LOGGER.info("Cross-tab hook armed for vector=%s", hook_vector)
-        st.success("Telemetry piped — open the RAG Chat tab to interrogate.")
+        st.success("Case context loaded — open the AI Shield Chat tab to "
+                   "continue the investigation.")
 
 
 def _render_horizon_block(horizons: Dict[str, object]) -> None:
@@ -421,7 +446,7 @@ def _render_horizon_block(horizons: Dict[str, object]) -> None:
         snapshot: Dict[str, object] = dict(snapshots.get(horizon, {}))
         with column:  # type: ignore[union-attr]
             st.metric(
-                f"{horizon} incident volume",
+                f"{HORIZON_LABELS.get(horizon, horizon)} — Incidents",
                 int(snapshot.get("incident_volume", 0)),       # type: ignore[arg-type]
                 delta=int(snapshot.get("volume_delta", 0)),    # type: ignore[arg-type]
             )
@@ -452,7 +477,7 @@ def render_analytics_tab(online: bool) -> None:
     st.divider()
     _render_kcvi_block(kcvi)
     st.divider()
-    st.markdown("**Time-Horizon Interval Matrix**")
+    st.markdown("**Incident Tracking Timeline**")
     _render_horizon_block(horizons)
 
 
@@ -479,7 +504,7 @@ def _render_citations(citations: List[Dict[str, object]]) -> None:
 
 def render_rag_tab(online: bool) -> None:
     """Interactive grounded search against the official vector corpus."""
-    st.subheader("Grounded Intelligence RAG Chat")
+    st.subheader("AI Shield Chat — Grounded Intelligence")
     if not online:
         render_offline_banner()
         return
@@ -487,7 +512,7 @@ def render_rag_tab(online: bool) -> None:
         st.session_state["chat_history"] = []
     prefill: str = str(st.session_state.pop("rag_prefill", ""))
     query: str = st.text_input(
-        "Ask the intelligence grid",
+        "Ask AI Shield Chat",
         value=prefill,
         placeholder="e.g. How do fake wedding invite APK scams operate?",
     )
@@ -548,7 +573,7 @@ def main() -> None:
     triage_tab, analytics_tab, rag_tab = st.tabs([
         "🛡️ Incident Triage & Live Ingest",
         "📊 Advanced Math Analytics",
-        "🔎 Grounded Intelligence RAG Chat",
+        "🔎 AI Shield Chat",
     ])
     with triage_tab:
         render_ingest_tab(online)
