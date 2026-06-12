@@ -1,0 +1,37 @@
+# Cyber Shield India — Threat Intelligence Grid
+# Python 3.13+ required. Minimum-version floors verified for 3.13 compatibility.
+
+# --- ASGI gateway ---
+fastapi>=0.115.12
+uvicorn[standard]>=0.34.0
+
+# --- UI layer ---
+streamlit>=1.55.0
+plotly>=6.0.0
+
+# --- LLM / RAG backbone ---
+langchain>=0.3.25
+langchain-google-genai>=2.1.0
+langchain-text-splitters>=0.3.8
+
+# --- Storage tiers ---
+chromadb>=1.0.0
+aiosqlite>=0.21.0
+
+# --- Async network & file I/O ---
+httpx>=0.28.1
+aiofiles>=24.1.0
+
+# --- Scraping & parsing ---
+beautifulsoup4>=4.13.0
+
+# --- Data & validation ---
+pandas>=2.2.3
+pydantic>=2.11.0
+
+# --- Configuration ---
+python-dotenv>=1.1.0
+
+# --- Test suite (Phase 6) ---
+pytest>=8.3.5
+pytest-asyncio>=0.26.0

@@ -1,0 +1,73 @@
+# Project Status & Lifecycle Ledger: Cyber Shield India
+
+## 🎯 Overarching Goal
+Build a working, production-ready, submittable RAG-LLM chatbot and interactive cybercrime visualization dashboard utilizing multi-agency government scrapers and automated news/expert entity extraction.
+
+## 🚀 Active Milestone
+- [ ] Phase 1: Environment Provisioning & Multi-Agency Asynchronous Ingestion Grid (Active)
+
+## 📋 Granular Development Lifecycle Checklist
+
+### 🔹 Phase 1: Environment Provisioning & Multi-Agency Ingestion Grid
+- [x] **Step 1.1:** Build physical workspace shell layout: ✅ (2026-06-12)
+  ```text
+  ├── app.py (Streamlit UI Engine)
+  ├── main.py (FastAPI Gateway)
+  ├── core/ (Configuration & Environmental Wrappers)
+  ├── database/ (SQLite schemas & ChromaDB persistence layers)
+  ├── services/ (RAG Inference, Expert Extractors, MAVI Analytics)
+  ├── utils/ (Asynchronous Scrapers, Rotating Agent Utilities)
+  └── tests/ (Automated Validation Test Suites)
+  ```
+- [x] **Step 1.2:** ✅ (2026-06-12) Generate `requirements.txt` containing exact, Python 3.13-compliant, verified packages (`fastapi`, `uvicorn`, `streamlit`, `langchain-google-genai`, `python-dotenv`, `chromadb`, `aiosqlite`, `httpx`, `beautifulsoup4`, `plotly`, `pandas`, `pydantic`).
+- [x] **Step 1.3:** ✅ (2026-06-12) Construct `.env` template configuration validating the `GOOGLE_API_KEY` environment target.
+- [ ] **Step 1.4:** Government Web Scraper Matrix (`utils/scraper.py`): Code fully async, user-agent rotating extraction modules pointing to:
+  - MHA Cyberdost Portal: Continuous polling of trending alert feeds and public threat advisories.
+  - DoT & Sanchar Saathi (TAFCOP/CEIR): Capture bulk connections disconnected for fraud, and device/IMEI blacklists.
+  - TRAI: Monitor SMS spoofing registry definitions and Unsolicited Commercial Communications (UCC) headers.
+  - NPCI & RBI Cyber Cells: Target payment rail circulars, UPI/AePS vulnerability reports, and digital lending app blocklists.
+  - NCIIPC & UIDAI: Parse cross-sector infrastructure protection sheets and Aadhaar biometric locking parameters.
+  - Statutory Legal Bases: Load text representations of the Information Technology Act (focusing on Sections 66A/C/D amendments) and the Digital Personal Data Protection (DPDP) Act.
+  - State Cyber Bureaus: Ingest bulletins from Telangana Cyber Security Bureau (TCSB), Maharashtra Cyber, Karnataka CEN, and Haryana/Delhi Police.
+- [ ] **Step 1.5:** Expert Intelligence Stream Parser (`services/expert_feed.py`): Build target filters to ingest unstructured commentary, case logs, and investigative analysis from verified channels of top digital policing strategists, including Dr. Rakshit Tandon and Amit Dubey.
+- [ ] **Step 1.6:** Structured News Triage Engine: Aggregate cybersecurity articles from top business/tech publications (ET Telecom, MediaNama, Inc42, Gadgets360) into continuous raw text string queues.
+- [ ] **Step 1.7:** Document Extraction Pipeline (`services/ingestion.py`): Create continuous data streaming parsers to segment dense government handbooks into clean arrays using `RecursiveCharacterTextSplitter` configured to an exact 800-token size and 100-token overlap framework.
+
+### 🔹 Phase 2: Vector Engineering & Relational Schema Compilation
+- [ ] **Step 2.1:** Instantiate ChromaDB collection maps with complete architectural indexing parameters (`source`, `url`, `date_published`, `jurisdiction`, `threat_category`).
+- [ ] **Step 2.2:** Code explicit SQL migration definitions via `aiosqlite` establishing these real-world database tables:
+  - `historical_ncrb_cases`: Schema covering [State, Year, Category, Incidents, Convictions, Chargesheet_Rate].
+  - `i4c_financial_metrics`: Schema covering [Timestamp, Incurred_Loss, Prevented_Capital, Recovery_Ratio].
+  - `demographic_risk_profiles`: Schema covering [Age_Group, Gender, Geographic_Tier, Occupation, Dominant_Modus_Operandi].
+  - `apprehension_ledger`: Schema covering [Arrest_ID, Date, State, Enforcement_Unit, Criminals_Caught, Scam_Type].
+- [ ] **Step 2.3:** Downstream Extraction Controller: Write zero-shot structured Pydantic models paired with Gemini 2.5 Flash to automatically process raw, unstructured news and expert feeds into clean, database-insertable JSON blocks.
+
+### 🔹 Phase 3: Analytical Engine Execution & Multi-Interval Triage Processing
+- [ ] **Step 3.1:** Code the mathematical processor for Mule Account Velocity Index (MAVI) inside `services/analytics.py` to identify operational money mule hotspots.
+- [ ] **Step 3.2:** Execute the Kill Chain Vulnerability Index aggregator to output dynamic real-time percentage breakdowns of distribution vectors.
+- [ ] **Step 3.3:** Build downstream aggregation workers to process all analytical relational streams into specific, time-horizon snapshots: 24 Hours, 7 Days, 30 Days, and 1 Year.
+
+### 🔹 Phase 4: FastAPI Gateway Foundations & Prompt Guardrails
+- [ ] **Step 4.1:** Establish the global ASGI server framework (`main.py`) declaring endpoint routing channels for analytical data retrievals.
+- [ ] **Step 4.2:** Build `services/rag_service.py` using `ChatGoogleGenerativeAI` targeting the Gemini 2.5 extended configuration.
+- [ ] **Step 4.3:** Hardcode system prompt architectures enforcing the strict government safety boundary fallback and citation assembly logic.
+
+### 🔹 Phase 5: Production Streamlit Command Center Interface Assembly (`app.py`)
+- [ ] **Step 5.1:** Initiate a modern, wide-layout Streamlit application frame using localized CSS components for a high-fidelity visual design.
+- [ ] **Step 5.2:** Tab 1 Architecture (🛡️ Assistant Interface): Construct stateful conversational chat fields incorporating custom HTML citation cards.
+- [ ] **Step 5.3:** Tab 2 Architecture (📊 Threat Radar Dashboard): Implement these interactive dashboard zones:
+  - Interval Matrix: Top horizontal menu selectors to dynamically toggle metrics across 24 Hours, 7 Days, 30 Days, and 1 Year scales.
+  - KPI Monitoring Strip: High-visibility reactive cards showing Total Frauds Reported, Total Capital Frozen/Saved (via I4C 1930 mechanics), Cybercriminals Apprehended, and active Top Threat Vectors.
+  - Geographic Balance Matrix: A Plotly horizontal grouped chart analyzing states (Telangana, Haryana, Karnataka, etc.) by comparing total damage metrics against proactive averted fund ratios.
+  - Demographic Risk Mapping: Grouped multi-axis radar charts tracing relationships between victim occupations, age clusters, and specific scam types.
+  - Live Incident Stream Panel: A real-time data table reflecting live processed scam events with corresponding platform tags.
+- [ ] **Step 5.4:** Cross-Tab RAG Query Injection Hook: Inject the communication layer that captures precise web event coordinate selections from Plotly elements and automatically pipes that localized telemetry into the Tab 1 conversation buffer for immediate natural language interrogation.
+- [ ] **Step 5.5:** Bind clear global caching wrappers (`@st.cache_data`) across heavy data retrieval modules.
+
+### 🔹 Phase 6: Automated Verification & Adversarial Stress Testing
+- [ ] **Step 6.1:** Build background event workers that simulate cron loops to update system repositories with real-time CERT-In bulletins.
+- [ ] **Step 6.2:** Develop an automated test configuration (`tests/test_system.py`) to run programmatic assertions on database payloads.
+- [ ] **Step 6.3:** Run targeted adversarial prompts against the prompt engine to verify that safety boundaries cannot be bypassed.
+
+## ⚠️ Blockers & Deferred Decisions
+- None. Explicitly configured for production-grade standalone deployment using SQLite, local ChromaDB persistence, and the Gemini 2.5 API.
