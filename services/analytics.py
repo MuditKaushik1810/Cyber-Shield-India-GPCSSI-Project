@@ -99,6 +99,7 @@ TACTICAL_DANGER_WEIGHTS: Dict[str, float] = {
     "payment_fraud": 0.85,
     "investment_scam": 0.80,
     "voip_spoofing": 0.75,
+    "sms_spoofing": 0.72,
     "sim_impersonation": 0.70,
     "accessibility_exploit": 0.65,
     "general_cyber": 0.40,
@@ -379,6 +380,174 @@ class MaviAnalyticsProcessor:
 
 
 # --------------------------------------------------------------------------- #
+# Step 3.2 — Kill Chain Vulnerability Index (KCVI) Aggregator.                #
+# --------------------------------------------------------------------------- #
+
+# Cyber Kill Chain stage taxonomy for the Indian fraud delivery fabric.
+STAGE_INFILTRATION: str = "Infiltration"
+STAGE_EXPLOITATION: str = "Exploitation"
+STAGE_LATERAL_MOVEMENT: str = "Lateral Movement"
+STAGE_EXFILTRATION: str = "Exfiltration/Action on Objectives"
+
+KILL_CHAIN_STAGES: Tuple[str, ...] = (
+    STAGE_INFILTRATION,
+    STAGE_EXPLOITATION,
+    STAGE_LATERAL_MOVEMENT,
+    STAGE_EXFILTRATION,
+)
+
+# Delivery/threat vector -> kill chain stage. Unmapped vectors land in
+# Exploitation as the conservative middle of the chain.
+KILL_CHAIN_STAGE_MAP: Dict[str, str] = {
+    "apk_sideloading": STAGE_INFILTRATION,
+    "sms_spoofing": STAGE_INFILTRATION,
+    "voip_spoofing": STAGE_INFILTRATION,
+    "digital_arrest": STAGE_INFILTRATION,
+    "accessibility_exploit": STAGE_EXPLOITATION,
+    "mobile_os_vulnerability": STAGE_EXPLOITATION,
+    "general_cyber": STAGE_EXPLOITATION,
+    "sim_impersonation": STAGE_LATERAL_MOVEMENT,
+    "payment_fraud": STAGE_EXFILTRATION,
+    "investment_scam": STAGE_EXFILTRATION,
+}
+DEFAULT_KILL_CHAIN_STAGE: str = STAGE_EXPLOITATION
+
+
+class KcviResult(BaseModel):
+    """Structured output of one KCVI aggregation pass."""
+
+    vector_distribution: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Vector -> exact fractional share; shares sum to 1.0.",
+    )
+    stage_distribution: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Kill chain stage -> aggregated fractional share.",
+    )
+    single_point_of_failure: str = Field(
+        description="Stage carrying the highest danger-weighted concentration.",
+    )
+    vulnerability_index: float = Field(
+        ge=0.0, le=100.0,
+        description="Danger-weighted intensity of the failure stage (0-100).",
+    )
+    dominant_vector: Optional[str] = None
+    sample_size: int = Field(ge=0)
+    computed_at: str
+
+
+def _execute_kcvi_kernel(
+    frequency: Dict[str, int],
+) -> Tuple[Dict[str, float], Dict[str, float], str, float, Optional[str]]:
+    """Pure KCVI kernel over a vector frequency table.
+
+    Returns (vector_distribution, stage_distribution, failure_stage,
+    vulnerability_index, dominant_vector). Defensive against empty input:
+    an empty table yields empty distributions and a zero index — no
+    division singularities.
+    """
+    total: int = sum(frequency.values())
+    if total <= 0:
+        return {}, {}, "none", 0.0, None
+
+    # Exact fractional shares — kept unrounded so the array sums to 1.0.
+    vector_distribution: Dict[str, float] = {
+        vector: count / total for vector, count in frequency.items()
+    }
+    drift: float = abs(math.fsum(vector_distribution.values()) - 1.0)
+    if drift > 1e-9:
+        raise ArithmeticError(
+            f"KCVI normalization drift exceeded tolerance: {drift:.3e}"
+        )
+
+    # Stage aggregation and danger-weighted stage intensities.
+    stage_distribution: Dict[str, float] = {stage: 0.0 for stage in KILL_CHAIN_STAGES}
+    stage_intensity: Dict[str, float] = {stage: 0.0 for stage in KILL_CHAIN_STAGES}
+    for vector, share in vector_distribution.items():
+        stage: str = KILL_CHAIN_STAGE_MAP.get(vector, DEFAULT_KILL_CHAIN_STAGE)
+        stage_distribution[stage] += share
+        stage_intensity[stage] += share * TACTICAL_DANGER_WEIGHTS.get(
+            vector, DEFAULT_TACTICAL_WEIGHT
+        )
+
+    failure_stage: str
+    failure_intensity: float
+    failure_stage, failure_intensity = max(
+        stage_intensity.items(), key=lambda pair: (pair[1], pair[0])
+    )
+    vulnerability_index: float = round(min(100.0, max(0.0, 100.0 * failure_intensity)), 2)
+    if not math.isfinite(vulnerability_index):
+        raise OverflowError("KCVI produced a non-finite vulnerability index")
+
+    dominant_vector: Optional[str] = max(
+        vector_distribution.items(), key=lambda pair: (pair[1], pair[0])
+    )[0]
+    return (
+        vector_distribution,
+        stage_distribution,
+        failure_stage,
+        vulnerability_index,
+        dominant_vector,
+    )
+
+
+async def calculate_kcvi(
+    frequency: Optional[Dict[str, int]] = None,
+    database_path: Path = SQLITE_PATH,
+) -> KcviResult:
+    """Compute the Kill Chain Vulnerability Index.
+
+    With no ``frequency`` table supplied, aggregates real-time delivery
+    vector counts from the relational ``incidents`` table; an injected
+    table (used by tests and replay tooling) bypasses the database. The
+    statistical kernel runs off-loop via ``asyncio.to_thread``.
+    """
+    if frequency is None:
+        async with aiosqlite.connect(database_path) as connection:
+            try:
+                cursor: aiosqlite.Cursor = await connection.execute(
+                    "SELECT threat_category, COUNT(*) FROM incidents "
+                    "GROUP BY threat_category"
+                )
+                rows: List[Tuple[str, int]] = list(await cursor.fetchall())
+            except aiosqlite.Error:
+                LOGGER.exception("KCVI delivery-vector aggregation query failed")
+                raise
+        frequency = {row[0]: int(row[1]) for row in rows}
+
+    try:
+        (
+            vector_distribution,
+            stage_distribution,
+            failure_stage,
+            vulnerability_index,
+            dominant_vector,
+        ) = await asyncio.to_thread(_execute_kcvi_kernel, dict(frequency))
+    except ZeroDivisionError:
+        LOGGER.exception("Division singularity inside KCVI kernel")
+        raise
+    except (ArithmeticError, OverflowError):
+        LOGGER.exception("Arithmetic anomaly inside KCVI kernel")
+        raise
+
+    result: KcviResult = KcviResult(
+        vector_distribution=vector_distribution,
+        stage_distribution=stage_distribution,
+        single_point_of_failure=failure_stage,
+        vulnerability_index=vulnerability_index,
+        dominant_vector=dominant_vector,
+        sample_size=sum(frequency.values()),
+        computed_at=datetime.now(timezone.utc).isoformat(),
+    )
+    LOGGER.info(
+        "KCVI aggregated: index=%.2f failure_stage=%s dominant=%s (n=%d)",
+        result.vulnerability_index, result.single_point_of_failure,
+        result.dominant_vector or "-", result.sample_size,
+    )
+    return result
+
+
+# --------------------------------------------------------------------------- #
 # In-module validation harness — mock high-threat 'Digital Arrest' campaign.  #
 # --------------------------------------------------------------------------- #
 
@@ -481,5 +650,73 @@ async def _run_validation_harness() -> None:
     print("MAVI VALIDATION HARNESS: PASS")
 
 
+async def _run_kcvi_validation_harness() -> None:
+    """Prove KCVI normalization, dominance detection, and stage mapping."""
+    # Synthetic mixed dataset: 60% APK delivery, 30% SMS spoofing, 10% VoIP.
+    synthetic: Dict[str, int] = {
+        "apk_sideloading": 60,
+        "sms_spoofing": 30,
+        "voip_spoofing": 10,
+    }
+    result: KcviResult = await calculate_kcvi(frequency=synthetic)
+
+    # Percentage array must normalize flawlessly to 100%.
+    distribution_sum: float = math.fsum(result.vector_distribution.values())
+    assert math.isclose(distribution_sum, 1.0, abs_tol=1e-9), (
+        f"distribution must sum to 1.0, got {distribution_sum}"
+    )
+    assert math.isclose(result.vector_distribution["apk_sideloading"], 0.60)
+    assert math.isclose(result.vector_distribution["sms_spoofing"], 0.30)
+    assert math.isclose(result.vector_distribution["voip_spoofing"], 0.10)
+
+    # Dominant infiltration vector and single point of failure.
+    assert result.dominant_vector == "apk_sideloading"
+    assert result.single_point_of_failure == STAGE_INFILTRATION
+    assert math.isclose(result.stage_distribution[STAGE_INFILTRATION], 1.0)
+    expected_index: float = round(
+        100.0 * (0.60 * 0.90 + 0.30 * 0.72 + 0.10 * 0.75), 2
+    )
+    assert result.vulnerability_index == expected_index, (
+        f"expected index {expected_index}, got {result.vulnerability_index}"
+    )
+
+    # Multi-stage spread: exfiltration-heavy mix must move the failure point.
+    spread: Dict[str, int] = {
+        "payment_fraud": 50,
+        "investment_scam": 20,
+        "apk_sideloading": 20,
+        "sim_impersonation": 10,
+    }
+    spread_result: KcviResult = await calculate_kcvi(frequency=spread)
+    assert spread_result.single_point_of_failure == STAGE_EXFILTRATION
+    assert math.isclose(
+        math.fsum(spread_result.stage_distribution.values()), 1.0, abs_tol=1e-9
+    )
+
+    # Defensive gate: empty dataset yields a clean zero, no singularities.
+    empty_result: KcviResult = await calculate_kcvi(frequency={})
+    assert empty_result.vulnerability_index == 0.0
+    assert empty_result.single_point_of_failure == "none"
+    assert empty_result.sample_size == 0
+
+    print("--- KCVI aggregation ---")
+    print(f"Synthetic mix        : index={result.vulnerability_index:.2f} "
+          f"SPOF={result.single_point_of_failure} "
+          f"dominant={result.dominant_vector}")
+    print(f"  distribution       : "
+          f"{ {k: round(v, 4) for k, v in result.vector_distribution.items()} }")
+    print(f"Exfiltration mix     : index={spread_result.vulnerability_index:.2f} "
+          f"SPOF={spread_result.single_point_of_failure}")
+    print(f"Empty dataset        : index={empty_result.vulnerability_index:.2f} "
+          f"SPOF={empty_result.single_point_of_failure}")
+    print("KCVI VALIDATION HARNESS: PASS")
+
+
+async def _run_all_harnesses() -> None:
+    """Execute the MAVI and KCVI validation harnesses sequentially."""
+    await _run_validation_harness()
+    await _run_kcvi_validation_harness()
+
+
 if __name__ == "__main__":
-    asyncio.run(_run_validation_harness())
+    asyncio.run(_run_all_harnesses())
