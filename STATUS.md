@@ -4,7 +4,8 @@
 Build a working, production-ready, submittable RAG-LLM chatbot and interactive cybercrime visualization dashboard utilizing multi-agency government scrapers and automated news/expert entity extraction.
 
 ## 🚀 Active Milestone
-- [ ] Phase 1: Environment Provisioning & Multi-Agency Asynchronous Ingestion Grid (Active)
+- [x] Phase 1: Environment Provisioning & Multi-Agency Asynchronous Ingestion Grid ✅ (Completed 2026-06-12)
+- [ ] Phase 2: Vector Engineering & Relational Schema Compilation (Active)
 
 ## 📋 Granular Development Lifecycle Checklist
 
@@ -31,7 +32,7 @@ Build a working, production-ready, submittable RAG-LLM chatbot and interactive c
   - State Cyber Bureaus: Ingest bulletins from Telangana Cyber Security Bureau (TCSB), Maharashtra Cyber, Karnataka CEN, and Haryana/Delhi Police.
 - [x] **Step 1.5:** ✅ (2026-06-12) Expert Intelligence Stream Parser (`services/expert_feed.py`): Build target filters to ingest unstructured commentary, case logs, and investigative analysis from verified channels of top digital policing strategists, including Dr. Rakshit Tandon and Amit Dubey.
 - [x] **Step 1.6:** ✅ (2026-06-12) Structured News Triage Engine: Aggregate cybersecurity articles from top business/tech publications (ET Telecom, MediaNama, Inc42, Gadgets360) into continuous raw text string queues.
-- [ ] **Step 1.7:** Document Extraction Pipeline (`services/ingestion.py`): Create continuous data streaming parsers to segment dense government handbooks into clean arrays using `RecursiveCharacterTextSplitter` configured to an exact 800-token size and 100-token overlap framework.
+- [x] **Step 1.7:** ✅ (2026-06-12) Document Extraction Pipeline (`services/ingestion.py`): Create continuous data streaming parsers to segment dense government handbooks into clean arrays using `RecursiveCharacterTextSplitter` configured to an exact 800-token size and 100-token overlap framework.
 
 ### 🔹 Phase 2: Vector Engineering & Relational Schema Compilation
 - [ ] **Step 2.1:** Instantiate ChromaDB collection maps with complete architectural indexing parameters (`source`, `url`, `date_published`, `jurisdiction`, `threat_category`).
