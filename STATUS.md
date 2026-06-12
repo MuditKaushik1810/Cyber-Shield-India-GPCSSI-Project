@@ -29,8 +29,8 @@ Build a working, production-ready, submittable RAG-LLM chatbot and interactive c
   - NCIIPC & UIDAI: Parse cross-sector infrastructure protection sheets and Aadhaar biometric locking parameters.
   - Statutory Legal Bases: Load text representations of the Information Technology Act (focusing on Sections 66A/C/D amendments) and the Digital Personal Data Protection (DPDP) Act.
   - State Cyber Bureaus: Ingest bulletins from Telangana Cyber Security Bureau (TCSB), Maharashtra Cyber, Karnataka CEN, and Haryana/Delhi Police.
-- [ ] **Step 1.5:** Expert Intelligence Stream Parser (`services/expert_feed.py`): Build target filters to ingest unstructured commentary, case logs, and investigative analysis from verified channels of top digital policing strategists, including Dr. Rakshit Tandon and Amit Dubey.
-- [ ] **Step 1.6:** Structured News Triage Engine: Aggregate cybersecurity articles from top business/tech publications (ET Telecom, MediaNama, Inc42, Gadgets360) into continuous raw text string queues.
+- [x] **Step 1.5:** ✅ (2026-06-12) Expert Intelligence Stream Parser (`services/expert_feed.py`): Build target filters to ingest unstructured commentary, case logs, and investigative analysis from verified channels of top digital policing strategists, including Dr. Rakshit Tandon and Amit Dubey.
+- [x] **Step 1.6:** ✅ (2026-06-12) Structured News Triage Engine: Aggregate cybersecurity articles from top business/tech publications (ET Telecom, MediaNama, Inc42, Gadgets360) into continuous raw text string queues.
 - [ ] **Step 1.7:** Document Extraction Pipeline (`services/ingestion.py`): Create continuous data streaming parsers to segment dense government handbooks into clean arrays using `RecursiveCharacterTextSplitter` configured to an exact 800-token size and 100-token overlap framework.
 
 ### 🔹 Phase 2: Vector Engineering & Relational Schema Compilation
