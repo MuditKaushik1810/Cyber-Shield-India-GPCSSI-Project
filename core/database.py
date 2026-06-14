@@ -98,6 +98,14 @@ VECTOR_COLLECTION_SPECS: Dict[str, Dict[str, str]] = {
             "from verified digital policing experts."
         ),
     },
+    "research_corpus": {
+        "hnsw:space": "cosine",
+        "description": (
+            "Open-access research corpus: high-density text chunks from the "
+            "autonomous ingestion worker, each mapped back to its "
+            "fraud_records.id for clean source attribution during RAG."
+        ),
+    },
 }
 
 
@@ -250,6 +258,30 @@ SCHEMA_DDL: Tuple[str, ...] = (
         scam_type        TEXT    NOT NULL
     )
     """,
+    # -- Open-access research repository (autonomous ingestion worker) --------
+    # One row per AI-synthesized document extract. Raw chunks live in the
+    # ChromaDB ``research_corpus`` collection, keyed by this table's id.
+    """
+    CREATE TABLE IF NOT EXISTS fraud_records (
+        id                            INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_platform               TEXT    NOT NULL,
+        source_tier                   TEXT    NOT NULL DEFAULT 'dynamic'
+                                          CHECK (source_tier IN ('static','dynamic','demo')),
+        publish_timestamp             TEXT,
+        state                         TEXT,
+        city                          TEXT,
+        scam_vector_type              TEXT,
+        extracted_case_count          INTEGER NOT NULL DEFAULT 0,
+        financial_loss_inr            REAL    NOT NULL DEFAULT 0.0,
+        demographic_age_bracket       TEXT,
+        demographic_gender_ratio      TEXT,
+        demographic_profession_target TEXT,
+        official_safety_advisory      TEXT,
+        source_url                    TEXT,
+        content_hash                  TEXT    UNIQUE,
+        ingested_at                   TEXT    NOT NULL DEFAULT (datetime('now'))
+    )
+    """,
 )
 
 INDEX_DDL: Tuple[str, ...] = (
@@ -260,6 +292,10 @@ INDEX_DDL: Tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_ncrb_state_year ON historical_ncrb_cases (state, year)",
     "CREATE INDEX IF NOT EXISTS idx_i4c_timestamp ON i4c_financial_metrics (timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_apprehension_state ON apprehension_ledger (state)",
+    "CREATE INDEX IF NOT EXISTS idx_fraud_state ON fraud_records (state)",
+    "CREATE INDEX IF NOT EXISTS idx_fraud_vector ON fraud_records (scam_vector_type)",
+    "CREATE INDEX IF NOT EXISTS idx_fraud_published ON fraud_records (publish_timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_fraud_tier ON fraud_records (source_tier)",
 )
 
 EXPECTED_TABLES: Tuple[str, ...] = (
@@ -271,6 +307,7 @@ EXPECTED_TABLES: Tuple[str, ...] = (
     "i4c_financial_metrics",
     "demographic_risk_profiles",
     "apprehension_ledger",
+    "fraud_records",
 )
 
 # Seed rows mapping the 7-vector tactic lattice (services/expert_feed.py).
@@ -339,6 +376,11 @@ class RelationalStoreManager:
         async with aiosqlite.connect(self.database_path) as connection:
             try:
                 await connection.execute("PRAGMA foreign_keys = ON")
+                # Write-Ahead Logging: lets the autonomous ingestion worker
+                # write while the Streamlit frontend reads concurrently
+                # without lock contention. WAL persists on the DB file.
+                await connection.execute("PRAGMA journal_mode=WAL")
+                await connection.execute("PRAGMA synchronous=NORMAL")
                 for ddl in SCHEMA_DDL:
                     await connection.execute(ddl)
                 for ddl in INDEX_DDL:

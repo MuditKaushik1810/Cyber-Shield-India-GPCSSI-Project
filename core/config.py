@@ -8,7 +8,7 @@ protocols, no authentication key is ever hardcoded.
 
 import os
 from pathlib import Path
-from typing import Final
+from typing import Final, Optional
 
 from dotenv import load_dotenv
 
@@ -42,3 +42,25 @@ def get_google_api_key() -> str:
             "and set a valid Google AI Studio API key."
         )
     return key
+
+
+def _get_optional(name: str) -> Optional[str]:
+    """Return an optional environment value, stripped, or None if unset."""
+    load_environment()
+    value: str = os.environ.get(name, "").strip().strip('"').strip("'")
+    return value or None
+
+
+def get_news_api_key() -> Optional[str]:
+    """Return the NewsAPI key for the dynamic media tier, or None."""
+    return _get_optional("NEWS_API_KEY")
+
+
+def get_custom_search_key() -> Optional[str]:
+    """Return the Google Programmable Search key for OSINT, or None."""
+    return _get_optional("GOOGLE_CUSTOM_SEARCH_KEY")
+
+
+def get_search_engine_id() -> Optional[str]:
+    """Return the Google Programmable Search engine (cx) id, or None."""
+    return _get_optional("GOOGLE_SEARCH_ENGINE_ID")
