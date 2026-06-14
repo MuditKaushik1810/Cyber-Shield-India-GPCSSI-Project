@@ -1,35 +1,37 @@
-"""Cyber Shield India — Production Streamlit Command Center (Phase 5).
+"""Cyber Shield India — Public Cybercrime Research & Trend Analytics Hub.
 
-Wide-layout operational terminal consuming the live FastAPI gateway at
-``http://localhost:8000/api/v1`` across three dedicated tabs:
+An open-access Streamlit frontend over the autonomously-curated research
+corpus. The frontend reads the relational tier in SQLite **read-only** mode
+(it can never mutate the worker-curated data) and calls Gemini in-process for
+the semantic explorer and the analytics agent.
 
-* **Tab 1 — Incident Triage & Live Ingest**: raw crime-string intake →
-  ``POST /api/v1/ingest/text`` → metric tiles + extraction data tables.
-* **Tab 2 — Advanced Math Analytics**: concurrent MAVI / KCVI / horizon
-  calls → color-coded KPI blocks, delivery-vector charts, SPOF callout,
-  and the rolling Interval Matrix — with a cross-tab hook piping vector
-  telemetry into the RAG interrogation buffer (ledger Step 5.4).
-* **Tab 3 — Semantic Knowledge Explorer**: deep semantic research queries →
-  ``POST /api/v1/rag/query`` → cited answers, with the mandated official
-  safety fallback rendered verbatim when a query is intercepted.
+Two top-level tabs:
 
-Backend unavailability degrades to a clean offline banner — never a raw
-connection trace. Runtime telemetry rotates daily into ``logs/frontend.log``.
+* **Macro Trends** — four Plotly modules (geospatial hot-spots, scam-vector
+  landscape, demographic vulnerability matrix, localized state tracker) under
+  a shared chronological filter (Past 1 Day / 1 Week / 1 Month / 1 Year).
+* **Semantic Knowledge Explorer** — an agentic chat that answers analytical
+  questions with custom charts (safe NL → read-only SQL → deterministic
+  Plotly) or grounded semantic answers, plus an isolated sidebar sandbox for
+  querying a researcher's own uploaded document (never merged into the corpus).
 
-Run:  streamlit run app.py   (gateway: python main.py)
+Run:  streamlit run app.py     (worker: python ingestion_worker.py)
 """
 
 import asyncio
+import io
 import logging
-from datetime import datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import httpx
 import pandas as pd
+import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+
+from services import research_repository as rr
+from services.research_agent import AnalyticalPlan, ResearchAgent, run_select
 
 # --------------------------------------------------------------------------- #
 # Frontend telemetry — daily-rotating channel: logs/frontend.log.             #
@@ -49,132 +51,33 @@ def _build_logger() -> logging.Logger:
     formatter: logging.Formatter = logging.Formatter(
         "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
     )
-    file_handler: TimedRotatingFileHandler = TimedRotatingFileHandler(
+    handler: TimedRotatingFileHandler = TimedRotatingFileHandler(
         filename=LOG_DIR / "frontend.log",
-        when="midnight",
-        backupCount=14,
-        encoding="utf-8",
+        when="midnight", backupCount=14, encoding="utf-8",
     )
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
     return logger
 
 
 LOGGER: logging.Logger = _build_logger()
 
-# --------------------------------------------------------------------------- #
-# Gateway communication utilities.                                            #
-# --------------------------------------------------------------------------- #
-
-API_BASE: str = "http://localhost:8000/api/v1"
-OFFLINE_BANNER: str = "System Offline: Awaiting Connection to Core Analytics Core"
-RAG_FALLBACK_MESSAGE: str = (
-    "I am sorry, but I can only provide cyber safety protocols verified by "
-    "official government sources."
-)
-
-THREAT_LEVEL_COLORS: Dict[str, str] = {
-    "CRITICAL": "#DC2626",
-    "ELEVATED": "#EA580C",
-    "GUARDED": "#D97706",
-    "LOW": "#059669",
+INTERVAL_ORDER: List[str] = ["1d", "1w", "1m", "1y"]
+INTERVAL_LABELS: Dict[str, str] = {
+    "1d": "Past 1 Day", "1w": "Past 1 Week",
+    "1m": "Past 1 Month", "1y": "Past 1 Year",
 }
 
-# Plain-English display labels for the rolling API horizon keys.
-HORIZON_LABELS: Dict[str, str] = {
-    "24h": "Past 24 Hours",
-    "7d": "Past 7 Days",
-    "30d": "Past 30 Days",
-    "1y": "Past Year",
+# City coordinates for the geospatial hot-spot map (offline, no geojson).
+CITY_COORDS: Dict[str, Tuple[float, float]] = {
+    "Faridabad": (28.4089, 77.3178), "Gurugram": (28.4595, 77.0266),
+    "New Delhi": (28.6139, 77.2090), "Delhi": (28.6139, 77.2090),
+    "Mumbai": (19.0760, 72.8777), "Hyderabad": (17.3850, 78.4867),
+    "Bengaluru": (12.9716, 77.5946), "Chennai": (13.0827, 80.2707),
+    "Jamtara": (23.9620, 86.8030), "Kolkata": (22.5726, 88.3639),
+    "Pune": (18.5204, 73.8567), "Ahmedabad": (23.0225, 72.5714),
+    "Jaipur": (26.9124, 75.7873), "Lucknow": (26.8467, 80.9462),
 }
-
-
-def api_get(path: str, timeout: float = 15.0) -> Optional[Dict[str, object]]:
-    """GET one gateway route; connection faults degrade to None."""
-    try:
-        response: httpx.Response = httpx.get(f"{API_BASE}{path}", timeout=timeout)
-        response.raise_for_status()
-        return response.json()
-    except httpx.ConnectError:
-        LOGGER.warning("GET %s: gateway unreachable", path)
-        return None
-    except httpx.TimeoutException:
-        LOGGER.warning("GET %s: gateway timeout", path)
-        return None
-    except httpx.HTTPStatusError as fault:
-        LOGGER.error("GET %s: HTTP %d", path, fault.response.status_code)
-        return None
-
-
-def api_post(
-    path: str, payload: Dict[str, object], timeout: float = 240.0
-) -> Tuple[Optional[Dict[str, object]], Optional[str]]:
-    """POST one gateway route; returns (body, clean_error_message)."""
-    try:
-        response: httpx.Response = httpx.post(
-            f"{API_BASE}{path}", json=payload, timeout=timeout
-        )
-        if response.status_code >= 400:
-            LOGGER.error("POST %s: HTTP %d — %s",
-                         path, response.status_code, response.text[:200])
-            return None, f"Gateway rejected the request (HTTP {response.status_code})."
-        return response.json(), None
-    except httpx.ConnectError:
-        LOGGER.warning("POST %s: gateway unreachable", path)
-        return None, OFFLINE_BANNER
-    except httpx.TimeoutException:
-        LOGGER.warning("POST %s: gateway timeout", path)
-        return None, "The analytics core timed out processing this payload."
-
-
-async def _gather_analytics() -> Tuple[
-    Optional[Dict[str, object]],
-    Optional[Dict[str, object]],
-    Optional[Dict[str, object]],
-]:
-    """Fetch MAVI, KCVI, and horizon matrices concurrently."""
-
-    async def _one(client: httpx.AsyncClient, path: str) -> Optional[Dict[str, object]]:
-        try:
-            response: httpx.Response = await client.get(f"{API_BASE}{path}")
-            response.raise_for_status()
-            return response.json()
-        except httpx.ConnectError:
-            LOGGER.warning("async GET %s: gateway unreachable", path)
-            return None
-        except httpx.TimeoutException:
-            LOGGER.warning("async GET %s: gateway timeout", path)
-            return None
-        except httpx.HTTPStatusError as fault:
-            LOGGER.error("async GET %s: HTTP %d", path, fault.response.status_code)
-            return None
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        results: Tuple[
-            Optional[Dict[str, object]],
-            Optional[Dict[str, object]],
-            Optional[Dict[str, object]],
-        ] = tuple(await asyncio.gather(  # type: ignore[assignment]
-            _one(client, "/analytics/mavi"),
-            _one(client, "/analytics/kcvi"),
-            _one(client, "/analytics/horizons"),
-        ))
-    return results
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def fetch_analytics_snapshot() -> Tuple[
-    Optional[Dict[str, object]],
-    Optional[Dict[str, object]],
-    Optional[Dict[str, object]],
-]:
-    """Cached concurrent snapshot of all three analytical matrices."""
-    return asyncio.run(_gather_analytics())
-
-
-# --------------------------------------------------------------------------- #
-# Layout chrome.                                                              #
-# --------------------------------------------------------------------------- #
 
 TERMINAL_CSS: str = """
 <style>
@@ -183,382 +86,512 @@ TERMINAL_CSS: str = """
     border-radius: 6px; padding: 14px 22px; margin-bottom: 14px;
     background: linear-gradient(90deg, #0F2537 0%, #133150 100%);
 }
-.cs-header h1 {
-    color: #F8F9FA; font-size: 1.35rem; letter-spacing: 0.12em;
-    margin: 0; font-weight: 700; text-transform: uppercase;
-}
-.cs-header p {
-    color: #7FA8C9; font-size: 0.72rem; letter-spacing: 0.22em;
-    margin: 4px 0 0 0; text-transform: uppercase;
-}
-.cs-header .desc {
-    color: #B9CFE0; font-size: 0.82rem; letter-spacing: 0.02em;
-    margin: 10px 0 0 0; text-transform: none; font-style: italic;
-}
-.cs-kpi {
-    border: 1px solid #E5E7EB; border-radius: 8px; padding: 16px 20px;
-    background: #FFFFFF; text-align: center;
-}
-.cs-kpi .label { font-size: 0.68rem; letter-spacing: 0.18em;
-    color: #6B7280; text-transform: uppercase; }
-.cs-kpi .value { font-size: 2.1rem; font-weight: 800; line-height: 1.2; }
-.cs-flag {
-    display: inline-block; border-radius: 999px; padding: 3px 12px;
-    font-size: 0.7rem; font-weight: 700; letter-spacing: 0.1em;
-    color: #FFFFFF; margin: 2px;
+.cs-header h1 { color: #F8F9FA; font-size: 1.4rem; letter-spacing: 0.06em;
+    margin: 0; font-weight: 800; }
+.cs-header p { color: #7FA8C9; font-size: 0.74rem; letter-spacing: 0.16em;
+    margin: 4px 0 0 0; text-transform: uppercase; }
+.cs-header .desc { color: #B9CFE0; font-size: 0.82rem; letter-spacing: 0.02em;
+    margin: 10px 0 0 0; text-transform: none; font-style: italic; }
+.cs-advisory {
+    border: 1px solid #D1E3F0; border-left: 4px solid #0A74B9;
+    border-radius: 6px; padding: 10px 14px; margin: 8px 0;
+    background: #FFFFFF; font-size: 0.84rem; color: #1F2937;
 }
 .cs-citation {
     border: 1px solid #D1E3F0; border-left: 4px solid #0A74B9;
     border-radius: 6px; padding: 8px 14px; margin: 6px 0;
     background: #FFFFFF; font-size: 0.8rem; color: #1F2937;
 }
-.cs-offline {
-    border: 1px solid #FCA5A5; border-left: 6px solid #DC2626;
-    border-radius: 6px; padding: 14px 20px; background: #FEF2F2;
-    color: #991B1B; font-weight: 600; letter-spacing: 0.04em;
+.cs-empty {
+    border: 1px dashed #CBD5E1; border-radius: 6px; padding: 18px 20px;
+    background: #FFFFFF; color: #475569; text-align: center;
 }
-/* Contrast patch: the navy secondaryBackgroundColor theme value darkens
-   input fields, leaving charcoal theme text invisible while typing. Force
-   crisp light fields with high-contrast text and a visible caret. */
+/* Contrast patch: navy theme darkens inputs; force readable field text. */
 .stTextInput input, .stTextArea textarea {
-    background-color: #FFFFFF !important;
-    color: #1F2937 !important;
-    caret-color: #0A74B9 !important;
-    border: 1px solid #CBD5E1 !important;
+    background-color: #FFFFFF !important; color: #1F2937 !important;
+    caret-color: #0A74B9 !important; border: 1px solid #CBD5E1 !important;
 }
 .stTextInput input::placeholder, .stTextArea textarea::placeholder {
     color: #9CA3AF !important;
 }
 div[data-baseweb="select"] > div {
-    background-color: #FFFFFF !important;
-    color: #1F2937 !important;
+    background-color: #FFFFFF !important; color: #1F2937 !important;
 }
 </style>
 """
 
 
-def render_header(online: bool) -> None:
-    """Crisp operational-terminal header bar with live status pill."""
-    status_color: str = "#059669" if online else "#DC2626"
-    status_text: str = "CORE LINK ESTABLISHED" if online else "CORE LINK DOWN"
+# --------------------------------------------------------------------------- #
+# Cached resources & data access.                                            #
+# --------------------------------------------------------------------------- #
+
+
+@st.cache_resource(show_spinner=False)
+def get_agent() -> Optional[ResearchAgent]:
+    """Construct the analytics agent once; None if Gemini is unconfigured."""
+    try:
+        return ResearchAgent()
+    except (RuntimeError, ValueError):
+        LOGGER.exception("Research agent unavailable")
+        return None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_hotspots(interval: str) -> List[Dict[str, object]]:
+    """Interval-filtered geospatial hot-spot rows (cached)."""
+    return rr.geospatial_hotspots(interval)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_vectors(interval: str) -> List[Dict[str, object]]:
+    """Interval-filtered scam-vector landscape rows (cached)."""
+    return rr.scam_vector_landscape(interval)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_demographic(interval: str, dimension: str) -> List[Dict[str, object]]:
+    """Interval-filtered demographic breakdown rows (cached)."""
+    return rr.demographic_matrix(interval, dimension)
+
+
+def _inr(value: float) -> str:
+    """Format an INR amount into a compact crore/lakh string."""
+    if value >= 1e7:
+        return f"₹{value / 1e7:.2f} Cr"
+    if value >= 1e5:
+        return f"₹{value / 1e5:.2f} L"
+    return f"₹{value:,.0f}"
+
+
+# --------------------------------------------------------------------------- #
+# Layout chrome.                                                              #
+# --------------------------------------------------------------------------- #
+
+
+def render_header() -> None:
+    """Academic identity header with the repository mission statement."""
     st.markdown(
-        f"""
+        """
         <div class="cs-header">
           <h1>🛡️ Cyber Shield India</h1>
-          <p>Unified Cybercrime Research Conspectus &amp; Trend Repository &nbsp;·&nbsp;
-             <span style="color:{status_color};">●</span> {status_text}
-             &nbsp;·&nbsp; {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M UTC')}</p>
-          <p class="desc">A centralized repository aggregating distributed public
-             cyber advisories, safety matrices, and threat data into a single
-             open-access hub for scholars, students, and trend researchers.</p>
+          <p>Unified Cybercrime Research Conspectus &amp; Trend Repository</p>
+          <p class="desc">A centralized repository aggregating distributed
+             public cyber advisories, safety matrices, and threat data into a
+             single open-access hub for scholars, students, and trend
+             researchers.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def render_offline_banner() -> None:
-    """Clean professional banner shown when the gateway is unreachable."""
-    st.markdown(
-        f'<div class="cs-offline">⚠️ {OFFLINE_BANNER}</div>',
-        unsafe_allow_html=True,
-    )
+def render_empty_state(message: str) -> None:
+    """Clean placeholder when the corpus has no data for the filter."""
+    st.markdown(f'<div class="cs-empty">{message}</div>', unsafe_allow_html=True)
 
 
 # --------------------------------------------------------------------------- #
-# Tab 1 — Incident Triage & Live Ingest.                                      #
+# Module 1 — Geospatial Crime Hot-Spots.                                      #
 # --------------------------------------------------------------------------- #
 
 
-def render_ingest_tab(online: bool) -> None:
-    """Raw crime-string intake with forensic extraction and result grids."""
-    st.subheader("Incident Triage & Live Ingest")
-    if not online:
-        render_offline_banner()
+def render_geospatial(interval: str) -> None:
+    """India hot-spot map (cities) + state-level financial-impact bars."""
+    st.markdown("#### 🗺️ Geospatial Crime Hot-Spots")
+    rows: List[Dict[str, object]] = cached_hotspots(interval)
+    if not rows:
+        render_empty_state("No regional datapoints in this window yet.")
         return
-    raw_text: str = st.text_area(
-        "Raw intelligence payload",
-        height=220,
-        placeholder=("Paste the raw crime narrative, advisory text, or "
-                     "investigator notes here (minimum 40 characters)…"),
-    )
-    source: str = st.text_input("Source label", value="manual_triage")
-    if st.button("⚡ Execute Forensic Extraction", type="primary"):
-        if len(raw_text.strip()) < 40:
-            st.warning("Payload must carry at least 40 characters of narrative.")
-            return
-        with st.spinner("Running Gemini extraction and dual-tier persistence…"):
-            manifest, error = api_post("/ingest/text", {
-                "text": raw_text.strip(),
-                "origin": "command-center",
-                "source": source.strip() or "manual_triage",
-            })
-        if manifest is None:
-            st.error(error or "Extraction failed — see logs/frontend.log.")
-            return
-        try:
-            tiles: List[Tuple[str, int]] = [
-                ("Incidents", int(manifest["incidents_inserted"])),     # type: ignore[arg-type]
-                ("Indicators", int(manifest["entities_upserted"])),     # type: ignore[arg-type]
-                ("Advisories", int(manifest["advisories_inserted"])),   # type: ignore[arg-type]
-                ("Vector Chunks", int(manifest["chunks_committed"])),   # type: ignore[arg-type]
-            ]
-            columns: List[object] = st.columns(len(tiles))
-            for column, (label, value) in zip(columns, tiles):
-                with column:  # type: ignore[union-attr]
-                    st.metric(label, value)
-            extraction: Dict[str, object] = manifest["extraction"]  # type: ignore[assignment]
-            incidents: List[Dict[str, object]] = extraction.get("incidents", [])  # type: ignore[assignment]
-            entities: List[Dict[str, object]] = extraction.get("entities", [])    # type: ignore[assignment]
-            advisories: List[Dict[str, object]] = extraction.get("advisories", [])  # type: ignore[assignment]
-            if incidents:
-                st.markdown("**Extracted incidents**")
-                st.dataframe(pd.DataFrame(incidents), use_container_width=True)
-            if entities:
-                st.markdown("**Extracted indicators**")
-                st.dataframe(pd.DataFrame(entities), use_container_width=True)
-            if advisories:
-                st.markdown("**Extracted advisories**")
-                st.dataframe(pd.DataFrame(advisories), use_container_width=True)
-            if not (incidents or entities or advisories):
-                st.info("Zero-fabrication guarantee held: no viable threat "
-                        "intelligence found in this payload.")
-            LOGGER.info("Ingest rendered: %s", tiles)
-        except (KeyError, TypeError, ValueError):
-            LOGGER.exception("Malformed ingest manifest payload")
-            st.error("The extraction manifest arrived malformed — "
-                     "see logs/frontend.log.")
+    frame: pd.DataFrame = pd.DataFrame(rows)
+    frame["loss"] = frame["loss"].fillna(0.0)
+    frame["cases"] = frame["cases"].fillna(0).astype(int)
 
-
-# --------------------------------------------------------------------------- #
-# Tab 2 — Advanced Math Analytics.                                            #
-# --------------------------------------------------------------------------- #
-
-
-def _render_mavi_block(mavi: Dict[str, object]) -> None:
-    """Color-coded composite MAVI KPI block with anomaly flags."""
-    try:
-        score: float = float(mavi["mavi_score"])        # type: ignore[arg-type]
-        level: str = str(mavi["threat_level"])
-        variance: float = float(mavi["variance"])       # type: ignore[arg-type]
-        flags: List[str] = [str(f) for f in mavi.get("anomaly_flags", [])]  # type: ignore[union-attr]
-    except (KeyError, TypeError, ValueError):
-        LOGGER.exception("Malformed MAVI payload")
-        st.error("MAVI payload malformed — see logs/frontend.log.")
-        return
-    color: str = THREAT_LEVEL_COLORS.get(level, "#6B7280")
-    left, right = st.columns([1, 2])
-    with left:
-        st.markdown(
-            f"""
-            <div class="cs-kpi">
-              <div class="label">National Cyber Risk Index</div>
-              <div class="value" style="color:{color};">{score:.2f}</div>
-              <span class="cs-flag" style="background:{color};">{level}</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with right:
-        st.metric("Trend Volatility Indicator", f"{variance:.2f}")
-        if flags:
-            chips: str = "".join(
-                f'<span class="cs-flag" style="background:#0F2537;">{flag}</span>'
-                for flag in flags
+    map_col, bar_col = st.columns([3, 2])
+    with map_col:
+        mapped: pd.DataFrame = frame[frame["city"].isin(CITY_COORDS)].copy()
+        if not mapped.empty:
+            mapped["lat"] = mapped["city"].map(lambda c: CITY_COORDS[c][0])
+            mapped["lon"] = mapped["city"].map(lambda c: CITY_COORDS[c][1])
+            figure: go.Figure = px.scatter_geo(
+                mapped, lat="lat", lon="lon", size="cases",
+                color="loss", hover_name="city",
+                hover_data={"state": True, "loss": ":,.0f", "cases": True,
+                            "lat": False, "lon": False},
+                color_continuous_scale="Reds", size_max=42,
+                title="Hot-spot cities — bubble size = cases, colour = ₹ loss",
             )
-            st.markdown(f"**Anomaly flags** {chips}", unsafe_allow_html=True)
+            figure.update_geos(scope="asia", center={"lat": 22.0, "lon": 80.0},
+                               lataxis_range=[6, 37], lonaxis_range=[67, 98],
+                               showcountries=True, landcolor="#EAEFF4")
+            figure.update_layout(height=360, margin={"l": 0, "r": 0, "t": 40, "b": 0})
+            st.plotly_chart(figure, use_container_width=True)
         else:
-            st.caption("No anomaly flags raised.")
-
-
-def _render_kcvi_block(kcvi: Dict[str, object]) -> None:
-    """KCVI delivery-vector distribution chart and SPOF callout."""
-    try:
-        distribution: Dict[str, float] = {
-            str(k): float(v)
-            for k, v in dict(kcvi["vector_distribution"]).items()  # type: ignore[arg-type]
-        }
-        spof: str = str(kcvi["single_point_of_failure"])
-        index: float = float(kcvi["vulnerability_index"])  # type: ignore[arg-type]
-        stages: Dict[str, float] = {
-            str(k): float(v)
-            for k, v in dict(kcvi.get("stage_distribution", {})).items()  # type: ignore[arg-type]
-        }
-    except (KeyError, TypeError, ValueError):
-        LOGGER.exception("Malformed KCVI payload")
-        st.error("KCVI payload malformed — see logs/frontend.log.")
-        return
-    st.markdown(f"**Prevalent Scam Architecture:** "
-                f"<span class='cs-flag' style='background:#DC2626;'>{spof}</span> "
-                f"&nbsp; Public Exposure Rating **{index:.2f}**",
-                unsafe_allow_html=True)
-    if not distribution:
-        st.info("No delivery-vector telemetry recorded yet.")
-        return
-    chart_left, chart_right = st.columns(2)
-    with chart_left:
-        vector_figure: go.Figure = go.Figure(go.Bar(
-            x=[round(v * 100.0, 2) for v in distribution.values()],
-            y=list(distribution.keys()),
-            orientation="h",
-            marker={"color": "#0A74B9"},
-        ))
-        vector_figure.update_layout(
-            title="Distribution of Emerging Scam Types", height=320,
-            margin={"l": 10, "r": 10, "t": 40, "b": 10},
+            render_empty_state("No mapped cities in this window.")
+    with bar_col:
+        by_state: pd.DataFrame = (
+            frame.groupby("state", as_index=False)["loss"].sum()
+            .sort_values("loss", ascending=True)
         )
-        st.plotly_chart(vector_figure, use_container_width=True)
-    with chart_right:
-        stage_figure: go.Figure = go.Figure(go.Bar(
-            x=[round(v * 100.0, 2) for v in stages.values()],
-            y=list(stages.keys()),
-            orientation="h",
-            marker={"color": "#0F2537"},
-        ))
-        stage_figure.update_layout(
-            title="Scam Infiltration Points", height=320,
-            margin={"l": 10, "r": 10, "t": 40, "b": 10},
+        bar: go.Figure = px.bar(
+            by_state, x="loss", y="state", orientation="h",
+            title="Financial impact by state (₹)",
+            color_discrete_sequence=["#0A74B9"],
         )
-        st.plotly_chart(stage_figure, use_container_width=True)
+        bar.update_layout(height=360, margin={"l": 0, "r": 0, "t": 40, "b": 0})
+        st.plotly_chart(bar, use_container_width=True)
 
-    # Cross-tab RAG injection hook (ledger Step 5.4): pipe the selected
-    # vector's telemetry into the Tab 3 interrogation buffer.
-    hook_vector: str = st.selectbox(
-        "Select a scam type to research", sorted(distribution),
+
+# --------------------------------------------------------------------------- #
+# Module 2 — Scam-Vector Landscape.                                           #
+# --------------------------------------------------------------------------- #
+
+
+def render_vector_landscape(interval: str) -> None:
+    """Distribution of emerging scam types by cases and financial toll."""
+    st.markdown("#### 🧬 Scam-Vector Landscape")
+    rows: List[Dict[str, object]] = cached_vectors(interval)
+    if not rows:
+        render_empty_state("No scam-vector datapoints in this window yet.")
+        return
+    frame: pd.DataFrame = pd.DataFrame(rows)
+    left, right = st.columns(2)
+    with left:
+        pie: go.Figure = px.pie(
+            frame, names="vector", values="cases", hole=0.45,
+            title="Share of reported cases by scam type",
+        )
+        pie.update_layout(height=340, margin={"l": 0, "r": 0, "t": 40, "b": 0})
+        st.plotly_chart(pie, use_container_width=True)
+    with right:
+        bar: go.Figure = px.bar(
+            frame.sort_values("loss"), x="loss", y="vector", orientation="h",
+            title="Financial toll by scam type (₹)",
+            color_discrete_sequence=["#0F2537"],
+        )
+        bar.update_layout(height=340, margin={"l": 0, "r": 0, "t": 40, "b": 0})
+        st.plotly_chart(bar, use_container_width=True)
+
+
+# --------------------------------------------------------------------------- #
+# Module 3 — Demographic Vulnerability Matrix.                                #
+# --------------------------------------------------------------------------- #
+
+
+def render_demographic(interval: str) -> None:
+    """Side-by-side age/gender/profession charts + live advisory panel."""
+    st.markdown("#### 👥 Demographic Vulnerability Matrix")
+    charts_col, advisory_col = st.columns([3, 2])
+    with charts_col:
+        dims: List[Tuple[str, str]] = [
+            ("age", "Age bracket"), ("gender", "Gender skew"),
+            ("profession", "Occupation"),
+        ]
+        triple: List[object] = st.columns(3)
+        for column, (dimension, label) in zip(triple, dims):
+            data: List[Dict[str, object]] = cached_demographic(interval, dimension)
+            with column:  # type: ignore[union-attr]
+                if not data:
+                    render_empty_state(f"No {label.lower()} data.")
+                    continue
+                frame: pd.DataFrame = pd.DataFrame(data)
+                fig: go.Figure = px.bar(
+                    frame, x="bucket", y="cases", title=label,
+                    color_discrete_sequence=["#0A74B9"],
+                )
+                fig.update_layout(height=300, xaxis_title=None, yaxis_title=None,
+                                  margin={"l": 0, "r": 0, "t": 40, "b": 0})
+                st.plotly_chart(fig, use_container_width=True)
+    with advisory_col:
+        st.markdown("**Matching official safety advisories**")
+        vectors: List[Dict[str, object]] = cached_vectors(interval)
+        vector_names: List[str] = [str(v["vector"]) for v in vectors]
+        chosen: Optional[str] = None
+        if vector_names:
+            chosen = st.selectbox("Filter advisories by scam type",
+                                  ["All"] + vector_names)
+            chosen = None if chosen == "All" else chosen
+        advisories: List[Dict[str, object]] = rr.latest_advisories(
+            interval, scam_vector=chosen, limit=6
+        )
+        if not advisories:
+            render_empty_state("No advisories matched this filter.")
+        for advisory in advisories:
+            st.markdown(
+                f"""<div class="cs-advisory">🛡️ <b>{advisory['scam_vector_type']}</b>
+                &nbsp;·&nbsp; {advisory.get('state') or 'National'}<br>
+                {advisory.get('official_safety_advisory') or ''}
+                <br><span style="color:#6B7280;font-size:0.72rem;">
+                {advisory.get('source_platform') or ''} ·
+                {advisory.get('dated') or ''}</span></div>""",
+                unsafe_allow_html=True,
+            )
+
+
+# --------------------------------------------------------------------------- #
+# Module 4 — Localized State Tracker.                                         #
+# --------------------------------------------------------------------------- #
+
+
+def render_state_tracker(interval: str) -> None:
+    """User-state metric cluster benchmarked against national averages."""
+    st.markdown("#### 📍 Localized State Tracker")
+    states: List[str] = rr.distinct_states()
+    if not states:
+        render_empty_state("No state-level data in the corpus yet.")
+        return
+    default_index: int = states.index("Haryana") if "Haryana" in states else 0
+    state: str = st.selectbox("Select your state context", states, index=default_index)
+    snapshot: Dict[str, object] = rr.state_versus_national(interval, state)
+    if not snapshot:
+        render_empty_state("No comparison available for this state/window.")
+        return
+    cases: int = int(snapshot["state_cases"])          # type: ignore[arg-type]
+    avg_cases: float = float(snapshot["national_avg_cases"])  # type: ignore[arg-type]
+    loss: float = float(snapshot["state_loss"])        # type: ignore[arg-type]
+    avg_loss: float = float(snapshot["national_avg_loss"])    # type: ignore[arg-type]
+    tiles: List[object] = st.columns(4)
+    with tiles[0]:
+        st.metric(f"{state} — reported cases", f"{cases:,}",
+                  delta=f"{cases - avg_cases:+,.0f} vs national avg")
+    with tiles[1]:
+        st.metric(f"{state} — financial loss", _inr(loss),
+                  delta=f"{_inr(loss - avg_loss)} vs avg")
+    with tiles[2]:
+        st.metric("National avg cases / state", f"{avg_cases:,.0f}")
+    with tiles[3]:
+        st.metric("National total loss", _inr(float(snapshot["national_total_loss"])))  # type: ignore[arg-type]
+
+
+def render_macro_trends_tab() -> None:
+    """The four analytics modules under one chronological filter."""
+    st.caption("Aggregated, AI-synthesized public-domain cybercrime trends. "
+               "Use the chronological filter to scope every module below.")
+    interval: str = st.radio(
+        "Chronological filter", INTERVAL_ORDER,
+        format_func=lambda key: INTERVAL_LABELS[key],
+        horizontal=True, index=3,
     )
-    if st.button("🔍 Query Centralized Repository"):
-        share: float = distribution.get(hook_vector, 0.0)
-        st.session_state["rag_prefill"] = (
-            f"Repository context: scam type={hook_vector}, "
-            f"share={share:.1%}, prevalent architecture={spof}. "
-            f"What do the aggregated public advisories say about "
-            f"{hook_vector.replace('_', ' ')} campaigns, and what safety "
-            f"protocols do official sources recommend?"
-        )
-        LOGGER.info("Cross-tab hook armed for vector=%s", hook_vector)
-        st.success("Research context loaded — open the Semantic Knowledge "
-                   "Explorer tab to run the query.")
+    st.divider()
+    render_geospatial(interval)
+    st.divider()
+    render_vector_landscape(interval)
+    st.divider()
+    render_demographic(interval)
+    st.divider()
+    render_state_tracker(interval)
 
 
-def _render_horizon_block(horizons: Dict[str, object]) -> None:
-    """Rolling Interval Matrix with volume deltas and accelerating trends."""
+# --------------------------------------------------------------------------- #
+# Agentic chart rendering (deterministic from the validated plan).            #
+# --------------------------------------------------------------------------- #
+
+
+def _build_chart(plan: AnalyticalPlan, frame: pd.DataFrame) -> Optional[go.Figure]:
+    """Deterministically build a Plotly figure from a validated plan."""
+    x: Optional[str] = plan.x if plan.x in frame.columns else None
+    y: Optional[str] = plan.y if plan.y in frame.columns else None
+    color: Optional[str] = plan.color if plan.color in frame.columns else None
+    if x is None and frame.columns.size:
+        x = str(frame.columns[0])
+    if y is None and frame.columns.size > 1:
+        y = str(frame.columns[1])
     try:
-        snapshots: Dict[str, Dict[str, object]] = dict(horizons["snapshots"])  # type: ignore[arg-type]
-    except (KeyError, TypeError):
-        LOGGER.exception("Malformed horizon payload")
-        st.error("Horizon payload malformed — see logs/frontend.log.")
-        return
-    order: List[str] = ["24h", "7d", "30d", "1y"]
-    columns: List[object] = st.columns(len(order))
-    for column, horizon in zip(columns, order):
-        snapshot: Dict[str, object] = dict(snapshots.get(horizon, {}))
-        with column:  # type: ignore[union-attr]
-            st.metric(
-                f"{HORIZON_LABELS.get(horizon, horizon)} — Incidents",
-                int(snapshot.get("incident_volume", 0)),       # type: ignore[arg-type]
-                delta=int(snapshot.get("volume_delta", 0)),    # type: ignore[arg-type]
-            )
-            st.caption(
-                f"new indicators: {snapshot.get('new_entity_count', 0)} · "
-                f"volatility {snapshot.get('entity_volatility_index', 0.0)}"
-            )
-            gaining: List[str] = [str(v) for v in snapshot.get("gaining_vectors", [])]  # type: ignore[union-attr]
-            if gaining:
-                st.markdown("\n".join(f"▲ `{vector}`" for vector in gaining[:4]))
-            else:
-                st.caption("no accelerating vectors")
+        if plan.chart_type == "pie" and x and y:
+            return px.pie(frame, names=x, values=y, title=plan.title)
+        if plan.chart_type == "line" and x and y:
+            return px.line(frame, x=x, y=y, color=color, title=plan.title,
+                           markers=True)
+        if plan.chart_type == "scatter" and x and y:
+            return px.scatter(frame, x=x, y=y, color=color, title=plan.title)
+        if x and y:
+            return px.bar(frame, x=x, y=y, color=color, title=plan.title,
+                          color_discrete_sequence=["#0A74B9"])
+    except (ValueError, KeyError):
+        LOGGER.exception("chart build failed for plan %s", plan.title)
+        return None
+    return None
 
 
-def render_analytics_tab(online: bool) -> None:
-    """Concurrent triple-endpoint analytics dashboard."""
-    st.subheader("Advanced Math Analytics")
-    if not online:
-        render_offline_banner()
+def _handle_analytical_question(question: str) -> None:
+    """Route a chat question through the agent (chart) or RAG (semantic)."""
+    agent: Optional[ResearchAgent] = get_agent()
+    plan: Optional[AnalyticalPlan] = agent.plan(question) if agent else None
+    if plan is not None and plan.intent == "chart" and plan.sql:
+        rows: List[Dict[str, object]]
+        error: Optional[str]
+        rows, error = run_select(plan.sql)
+        if error:
+            st.warning(f"Could not run that as a chart query ({error}). "
+                       "Falling back to a semantic answer.")
+        elif not rows:
+            st.info("That query returned no rows for the current corpus.")
+            return
+        else:
+            frame: pd.DataFrame = pd.DataFrame(rows)
+            figure: Optional[go.Figure] = _build_chart(plan, frame)
+            if figure is not None:
+                st.plotly_chart(figure, use_container_width=True)
+            with st.expander("Underlying data & query"):
+                st.code(plan.sql, language="sql")
+                st.dataframe(frame, use_container_width=True)
+            return
+    _render_semantic_answer(question)
+
+
+def _render_semantic_answer(question: str) -> None:
+    """Grounded RAG answer over the curated corpus, with citations."""
+    from services.rag_service import RAG_FALLBACK_MESSAGE, generate_response
+    try:
+        envelope: Dict[str, object] = asyncio.run(generate_response(question))
+    except RuntimeError:
+        LOGGER.exception("RAG inference failed")
+        st.error("The semantic engine is unavailable right now.")
         return
-    if st.button("🔄 Refresh analytical matrices"):
-        fetch_analytics_snapshot.clear()
-    mavi, kcvi, horizons = fetch_analytics_snapshot()
-    if mavi is None or kcvi is None or horizons is None:
-        render_offline_banner()
-        return
-    _render_mavi_block(mavi)
-    st.divider()
-    _render_kcvi_block(kcvi)
-    st.divider()
-    st.markdown("**Aggregated Incident Trends**")
-    _render_horizon_block(horizons)
+    if bool(envelope.get("grounded")):
+        st.markdown(str(envelope.get("answer", "")))
+        citations: List[Dict[str, object]] = envelope.get("citations", [])  # type: ignore[assignment]
+        for citation in citations:
+            st.markdown(
+                f"""<div class="cs-citation">📌 <b>{citation.get('source', '—')}</b>
+                &nbsp;·&nbsp; {citation.get('date_published') or 'undated'}
+                &nbsp;·&nbsp; {citation.get('threat_category') or 'general'}</div>""",
+                unsafe_allow_html=True,
+            )
+    else:
+        st.warning(f"🛡️ {RAG_FALLBACK_MESSAGE}")
 
 
 # --------------------------------------------------------------------------- #
-# Tab 3 — Grounded Intelligence RAG Chat.                                     #
+# Ad-hoc sandbox — isolated, session-only document querying.                  #
 # --------------------------------------------------------------------------- #
 
 
-def _render_citations(citations: List[Dict[str, object]]) -> None:
-    """Highlight inline structural citations as styled cards."""
-    for citation in citations:
-        st.markdown(
-            f"""
-            <div class="cs-citation">
-              📌 <b>{citation.get('source', 'unknown')}</b>
-              &nbsp;·&nbsp; {citation.get('date_published') or 'undated'}
-              &nbsp;·&nbsp; {citation.get('threat_category') or 'unclassified'}
-              &nbsp;·&nbsp; distance {citation.get('distance', '—')}
-            </div>
-            """,
-            unsafe_allow_html=True,
+def _read_upload(uploaded: object) -> str:
+    """Extract text from an uploaded PDF or text file."""
+    name: str = getattr(uploaded, "name", "upload")
+    raw: bytes = uploaded.read()  # type: ignore[attr-defined]
+    if name.lower().endswith(".pdf"):
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(raw))
+            return "\n".join((page.extract_text() or "") for page in reader.pages)
+        except (ImportError, ValueError, OSError):
+            LOGGER.exception("sandbox PDF parse failed")
+            return ""
+    try:
+        return raw.decode("utf-8", errors="ignore")
+    except (UnicodeDecodeError, AttributeError):
+        return ""
+
+
+def _ingest_sandbox_document(text: str) -> int:
+    """Embed an uploaded document into an isolated in-memory collection.
+
+    Uses a per-session ChromaDB EphemeralClient held in ``st.session_state`` —
+    it never touches the persistent store, so a researcher's private document
+    can never contaminate the curated corpus.
+    """
+    import chromadb
+    from core.database import VectorStoreManager
+    from services.ingestion import DocumentExtractionPipeline
+
+    client = chromadb.EphemeralClient()
+    collection = client.create_collection(
+        name="sandbox", embedding_function=VectorStoreManager.embedding_function()
+    )
+    chunks = DocumentExtractionPipeline().chunk_text(
+        text, {"source": "sandbox_upload"}, parent_key="sandbox"
+    )
+    if not chunks:
+        return 0
+    collection.add(
+        ids=[c.chunk_id for c in chunks],
+        documents=[c.text for c in chunks],
+    )
+    st.session_state["sandbox_collection"] = collection
+    return len(chunks)
+
+
+def _query_sandbox(question: str) -> None:
+    """Answer a question strictly from the uploaded session document."""
+    collection = st.session_state.get("sandbox_collection")
+    if collection is None:
+        st.info("Upload a document in the sidebar first.")
+        return
+    result: Dict[str, object] = collection.query(
+        query_texts=[question], n_results=4, include=["documents"]
+    )
+    documents: List[str] = result["documents"][0]  # type: ignore[index]
+    if not documents:
+        st.warning("No relevant passage found in the uploaded document.")
+        return
+    context: str = "\n\n".join(documents)
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    from langchain_google_genai._common import GoogleGenerativeAIError
+    from core.config import get_google_api_key
+    try:
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash", temperature=0.1,
+            google_api_key=get_google_api_key(),
         )
+        completion = llm.invoke([
+            SystemMessage(content=(
+                "You are answering ONLY from the researcher's uploaded "
+                "document excerpts below. If the answer is not present, say "
+                "so plainly. Do not use outside knowledge.")),
+            HumanMessage(content=f"EXCERPTS:\n{context}\n\nQUESTION: {question}"),
+        ])
+        st.markdown(str(completion.content))
+    except (GoogleGenerativeAIError, RuntimeError, ValueError):
+        LOGGER.exception("sandbox query failed")
+        st.error("Could not query the uploaded document right now.")
 
 
-def render_rag_tab(online: bool) -> None:
-    """Interactive grounded search against the official vector corpus."""
-    st.subheader("Semantic Knowledge Explorer")
+def render_sandbox_sidebar() -> None:
+    """Sidebar uploader for the isolated, session-only document sandbox."""
+    st.sidebar.markdown("### 📎 Ad-Hoc Document Sandbox")
+    st.sidebar.caption(
+        "Upload a PDF/text file to query during this session only. It is "
+        "embedded in volatile memory and **never** merged into the curated "
+        "repository."
+    )
+    uploaded = st.sidebar.file_uploader("Upload PDF or text", type=["pdf", "txt"])
+    if uploaded is not None and st.sidebar.button("Embed for this session"):
+        text: str = _read_upload(uploaded)
+        if len(text.strip()) < 40:
+            st.sidebar.warning("Could not extract usable text.")
+        else:
+            count: int = _ingest_sandbox_document(text)
+            st.sidebar.success(f"Embedded {count} passages (session-only).")
+    if "sandbox_collection" in st.session_state:
+        st.sidebar.info("A sandbox document is active this session.")
+
+
+def render_explorer_tab() -> None:
+    """Agentic chat + semantic explorer + sandbox querying."""
+    st.markdown("#### 🔎 Semantic Knowledge Explorer")
     st.caption(
         "Ask deep semantic research questions across our centralized "
         "repository of scraped multi-agency advisories (e.g., 'How have "
-        "digital arrest fraud methodologies evolved over the past quarter?')."
+        "digital arrest fraud methodologies evolved over the past quarter?'), "
+        "or request a custom analytical chart (e.g., 'Compare financial loss "
+        "by scam type across states this year')."
     )
-    if not online:
-        render_offline_banner()
-        return
-    if "chat_history" not in st.session_state:
-        st.session_state["chat_history"] = []
-    prefill: str = str(st.session_state.pop("rag_prefill", ""))
-    query: str = st.text_input(
-        "Semantic research query",
-        value=prefill,
-        placeholder=("e.g. How have digital arrest fraud methodologies "
-                     "evolved over the past quarter?"),
+    mode: str = st.radio(
+        "Query target", ["Curated repository", "My uploaded document"],
+        horizontal=True,
     )
-    if st.button("🔍 Run Semantic Query", type="primary") and query.strip():
-        with st.spinner("Retrieving official grounding and generating…"):
-            envelope, error = api_post(
-                "/rag/query", {"query": query.strip()}, timeout=120.0
-            )
-        if envelope is None:
-            st.error(error or "Inference failed — see logs/frontend.log.")
-        else:
-            st.session_state["chat_history"].append(envelope)
-    history: List[Dict[str, object]] = st.session_state["chat_history"]
-    for envelope in reversed(history):
-        try:
-            st.markdown(f"**🧑‍🎓 Research query:** {envelope.get('query', '')}")
-            answer: str = str(envelope.get("answer", ""))
-            grounded: bool = bool(envelope.get("grounded", False))
-            if grounded:
-                st.markdown(answer)
-                citations: List[Dict[str, object]] = envelope.get("citations", [])  # type: ignore[assignment]
-                if citations:
-                    _render_citations(citations)
+    question: str = st.text_input(
+        "Research query",
+        placeholder="e.g. Which states lost the most money to digital arrests?",
+    )
+    if st.button("🔍 Run Query", type="primary") and question.strip():
+        with st.spinner("Analyzing the repository…"):
+            if mode == "My uploaded document":
+                _query_sandbox(question.strip())
             else:
-                # The mandated official safety protocol fallback, verbatim.
-                st.warning(f"🛡️ {RAG_FALLBACK_MESSAGE}")
-                st.caption(f"gate: {envelope.get('fallback_reason', 'unknown')}")
-            st.divider()
-        except (KeyError, TypeError, ValueError):
-            LOGGER.exception("Malformed RAG envelope in history")
-            st.error("A response envelope arrived malformed — "
-                     "see logs/frontend.log.")
+                _handle_analytical_question(question.strip())
 
 
 # --------------------------------------------------------------------------- #
@@ -566,36 +599,29 @@ def render_rag_tab(online: bool) -> None:
 # --------------------------------------------------------------------------- #
 
 
-@st.cache_data(ttl=15, show_spinner=False)
-def backend_online() -> bool:
-    """Lightweight cached gateway liveness probe."""
-    return api_get("/analytics/kcvi", timeout=5.0) is not None
-
-
 def main() -> None:
-    """Assemble the wide-layout three-tab command center."""
+    """Assemble the wide-layout public research hub."""
     st.set_page_config(
-        page_title="Cyber Shield India — Command Center",
-        page_icon="🛡️",
-        layout="wide",
+        page_title="Cyber Shield India — Research Hub",
+        page_icon="🛡️", layout="wide",
     )
     st.markdown(TERMINAL_CSS, unsafe_allow_html=True)
-    online: bool = backend_online()
-    render_header(online)
-    if not online:
-        render_offline_banner()
-    triage_tab, analytics_tab, rag_tab = st.tabs([
-        "🛡️ Incident Triage & Live Ingest",
-        "📊 Advanced Math Analytics",
-        "🔎 Semantic Knowledge Explorer",
+    render_header()
+    corpus: int = rr.corpus_size()
+    st.sidebar.metric("Curated datapoints", f"{corpus:,}")
+    if corpus == 0:
+        st.info("The research corpus is empty. Run the ingestion worker "
+                "(`python ingestion_worker.py --seed-demo` for sample data, "
+                "or `python ingestion_worker.py` for live harvesting).")
+    render_sandbox_sidebar()
+    trends_tab, explorer_tab = st.tabs([
+        "📊 Macro Trends", "🔎 Semantic Knowledge Explorer",
     ])
-    with triage_tab:
-        render_ingest_tab(online)
-    with analytics_tab:
-        render_analytics_tab(online)
-    with rag_tab:
-        render_rag_tab(online)
-    LOGGER.info("Frame rendered (online=%s)", online)
+    with trends_tab:
+        render_macro_trends_tab()
+    with explorer_tab:
+        render_explorer_tab()
+    LOGGER.info("Frame rendered (corpus=%d)", corpus)
 
 
 if __name__ == "__main__":

@@ -91,7 +91,9 @@ MAX_GROUNDING_DISTANCE: float = 0.70
 GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
 INFERENCE_TIMEOUT_SECONDS: float = 90.0
 
-RAG_COLLECTIONS: tuple = ("threat_intel_chunks", "expert_feed_chunks")
+RAG_COLLECTIONS: tuple = (
+    "threat_intel_chunks", "expert_feed_chunks", "research_corpus",
+)
 
 GUARDRAIL_SYSTEM_PROMPT: str = (
     "You are the intelligence assistant of Cyber Shield India — an expert "
