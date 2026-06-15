@@ -333,33 +333,71 @@ def render_demographic(interval: str) -> None:
 
 
 def render_state_tracker(interval: str) -> None:
-    """User-state metric cluster benchmarked against national averages."""
+    """Raw live state telemetry overlaid against the NCRB control benchmark."""
     st.markdown("#### 📍 Localized State Tracker")
     states: List[str] = rr.distinct_states()
     if not states:
         render_empty_state("No state-level data in the corpus yet.")
         return
-    default_index: int = states.index("Haryana") if "Haryana" in states else 0
+    default_index: int = states.index("Tamil Nadu") if "Tamil Nadu" in states else 0
     state: str = st.selectbox("Select your state context", states, index=default_index)
     snapshot: Dict[str, object] = rr.state_versus_national(interval, state)
     if not snapshot:
         render_empty_state("No comparison available for this state/window.")
         return
-    cases: int = int(snapshot["state_cases"])          # type: ignore[arg-type]
-    avg_cases: float = float(snapshot["national_avg_cases"])  # type: ignore[arg-type]
-    loss: float = float(snapshot["state_loss"])        # type: ignore[arg-type]
-    avg_loss: float = float(snapshot["national_avg_loss"])    # type: ignore[arg-type]
-    tiles: List[object] = st.columns(4)
-    with tiles[0]:
-        st.metric(f"{state} — reported cases", f"{cases:,}",
-                  delta=f"{cases - avg_cases:+,.0f} vs national avg")
-    with tiles[1]:
-        st.metric(f"{state} — financial loss", _inr(loss),
-                  delta=f"{_inr(loss - avg_loss)} vs avg")
-    with tiles[2]:
-        st.metric("National avg cases / state", f"{avg_cases:,.0f}")
-    with tiles[3]:
-        st.metric("National total loss", _inr(float(snapshot["national_total_loss"])))  # type: ignore[arg-type]
+    live_cases: float = float(snapshot["live_cases"])         # type: ignore[arg-type]
+    live_loss: float = float(snapshot["live_loss"])           # type: ignore[arg-type]
+    bench_cases: float = float(snapshot["benchmark_cases"])   # type: ignore[arg-type]
+    bench_loss: float = float(snapshot["benchmark_loss"])     # type: ignore[arg-type]
+    window_label: str = INTERVAL_LABELS.get(interval, interval)
+
+    # Engineering ingestion-deficit alert (Step 3).
+    if bool(snapshot.get("ingestion_deficit")):
+        st.warning(
+            "⚠️ Potential Ingestion Deficit: High-baseline region yielding zero "
+            "telemetry. Verify crawler connectivity for this state's domains."
+        )
+    st.caption(f"Dominant historical vector: **{snapshot.get('primary_vector', '—')}** "
+               f"· NCRB annual baseline: {int(snapshot.get('annual_cases', 0)):,} cases")
+
+    # Two visually distinct metric groups — live telemetry vs control model.
+    live_col, bench_col = st.columns(2)
+    with live_col:
+        st.markdown("**🟢 Active Cases Captured (Live Crawl)**")
+        inner: List[object] = st.columns(2)
+        with inner[0]:
+            st.metric(f"Cases · {window_label}", f"{live_cases:,.0f}")
+        with inner[1]:
+            st.metric(f"Loss · {window_label}", _inr(live_loss))
+    with bench_col:
+        st.markdown("**🔶 NCRB Historical Benchmark (Prorated)**")
+        inner_b: List[object] = st.columns(2)
+        with inner_b[0]:
+            st.metric(f"Expected cases · {window_label}", f"{bench_cases:,.0f}")
+        with inner_b[1]:
+            st.metric(f"Expected loss · {window_label}", _inr(bench_loss))
+
+    # Live solid bar with the NCRB baseline as a dashed reference line.
+    figure: go.Figure = go.Figure()
+    figure.add_bar(x=["Reported cases"], y=[live_cases], name="Live captured",
+                   marker={"color": "#0A74B9"})
+    figure.add_hline(
+        y=bench_cases, line_dash="dash", line_color="#D97706",
+        annotation_text="NCRB Statistical Baseline", annotation_position="top left",
+    )
+    headroom: float = max(live_cases, bench_cases) * 1.25 or 1.0
+    figure.update_layout(
+        title=f"{state}: live telemetry vs NCRB baseline ({window_label})",
+        height=320, yaxis_range=[0, headroom],
+        margin={"l": 10, "r": 10, "t": 40, "b": 10}, showlegend=False,
+    )
+    st.plotly_chart(figure, use_container_width=True)
+    if live_cases < bench_cases:
+        st.caption("📉 Live captures are running **below** the historical NCRB "
+                   "baseline for this window.")
+    else:
+        st.caption("📈 Live captures are running **at or above** the historical "
+                   "NCRB baseline for this window.")
 
 
 def render_macro_trends_tab() -> None:
@@ -412,6 +450,12 @@ def _build_chart(plan: AnalyticalPlan, frame: pd.DataFrame) -> Optional[go.Figur
     return None
 
 
+STRICT_WINDOW_NOTE: str = (
+    "No matching records found for the strict time window. Displaying top "
+    "conceptual matches across the global corpus."
+)
+
+
 def _handle_analytical_question(question: str) -> None:
     """Route a chat question through the agent (chart) or RAG (semantic)."""
     agent: Optional[ResearchAgent] = get_agent()
@@ -422,25 +466,52 @@ def _handle_analytical_question(question: str) -> None:
         rows, error = run_select(plan.sql)
         if error:
             st.warning(f"Could not run that as a chart query ({error}). "
-                       "Falling back to a semantic answer.")
-        elif not rows:
-            st.info("That query returned no rows for the current corpus.")
+                       "Falling back to conceptual matches.")
+            _render_relaxed_fallback(question)
             return
-        else:
-            frame: pd.DataFrame = pd.DataFrame(rows)
-            figure: Optional[go.Figure] = _build_chart(plan, frame)
-            if figure is not None:
-                st.plotly_chart(figure, use_container_width=True)
-            with st.expander("Underlying data & query"):
-                st.code(plan.sql, language="sql")
-                st.dataframe(frame, use_container_width=True)
+        if not rows:
+            # Strict time/metadata filter returned zero rows — relax to
+            # ungated cosine similarity over the global corpus.
+            _render_relaxed_fallback(question)
             return
+        frame: pd.DataFrame = pd.DataFrame(rows)
+        figure: Optional[go.Figure] = _build_chart(plan, frame)
+        if figure is not None:
+            st.plotly_chart(figure, use_container_width=True)
+        with st.expander("Underlying data & query"):
+            st.code(plan.sql, language="sql")
+            st.dataframe(frame, use_container_width=True)
+        return
     _render_semantic_answer(question)
+
+
+def _render_relaxed_fallback(question: str) -> None:
+    """Strip strict filters and surface top conceptual corpus matches."""
+    from services.rag_service import RAG_FALLBACK_MESSAGE, relaxed_search
+    try:
+        matches: List[Dict[str, object]] = asyncio.run(relaxed_search(question))
+    except RuntimeError:
+        LOGGER.exception("relaxed semantic fallback failed")
+        st.warning(f"🛡️ {RAG_FALLBACK_MESSAGE}")
+        return
+    if not matches:
+        st.warning(f"🛡️ {RAG_FALLBACK_MESSAGE}")
+        return
+    st.info(f"🧭 {STRICT_WINDOW_NOTE}")
+    for match in matches:
+        st.markdown(
+            f"""<div class="cs-citation">📌 <b>{match.get('source', '—')}</b>
+            &nbsp;·&nbsp; {match.get('date_published') or 'undated'}
+            &nbsp;·&nbsp; {match.get('threat_category') or 'general'}
+            &nbsp;·&nbsp; similarity {1.0 - float(match.get('distance', 1.0)):.2f}
+            <br>{str(match.get('text', ''))[:320]}…</div>""",
+            unsafe_allow_html=True,
+        )
 
 
 def _render_semantic_answer(question: str) -> None:
     """Grounded RAG answer over the curated corpus, with citations."""
-    from services.rag_service import RAG_FALLBACK_MESSAGE, generate_response
+    from services.rag_service import generate_response
     try:
         envelope: Dict[str, object] = asyncio.run(generate_response(question))
     except RuntimeError:
@@ -458,7 +529,9 @@ def _render_semantic_answer(question: str) -> None:
                 unsafe_allow_html=True,
             )
     else:
-        st.warning(f"🛡️ {RAG_FALLBACK_MESSAGE}")
+        # No strict grounding — relax to conceptual matches rather than a
+        # dead-end refusal window.
+        _render_relaxed_fallback(question)
 
 
 # --------------------------------------------------------------------------- #

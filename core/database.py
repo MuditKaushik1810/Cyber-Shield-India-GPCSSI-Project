@@ -273,6 +273,11 @@ SCHEMA_DDL: Tuple[str, ...] = (
         scam_vector_type              TEXT,
         extracted_case_count          INTEGER NOT NULL DEFAULT 0,
         financial_loss_inr            REAL    NOT NULL DEFAULT 0.0,
+        -- Temporal classification (Phase 2): isolated case vs macro summary.
+        is_isolated_incident          INTEGER NOT NULL DEFAULT 1,
+        incident_loss_inr             REAL    NOT NULL DEFAULT 0.0,
+        is_macro_historical_summary   INTEGER NOT NULL DEFAULT 0,
+        macro_summary_loss_inr        REAL    NOT NULL DEFAULT 0.0,
         demographic_age_bracket       TEXT,
         demographic_gender_ratio      TEXT,
         demographic_profession_target TEXT,
@@ -280,6 +285,20 @@ SCHEMA_DDL: Tuple[str, ...] = (
         source_url                    TEXT,
         content_hash                  TEXT    UNIQUE,
         ingested_at                   TEXT    NOT NULL DEFAULT (datetime('now'))
+    )
+    """,
+    # -- National NCRB baseline model (Phase 1) ------------------------------
+    # Approximate annualized 'Crime in India' anchors per state/UT, used as a
+    # prorated statistical floor so the frontend never shows a baseline zero.
+    """
+    CREATE TABLE IF NOT EXISTS state_baselines (
+        id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+        state_name               TEXT    NOT NULL UNIQUE,
+        annual_cases             INTEGER NOT NULL DEFAULT 0,
+        annual_loss_inr          REAL    NOT NULL DEFAULT 0.0,
+        prorated_weekly_cases    REAL    NOT NULL DEFAULT 0.0,
+        prorated_weekly_loss_inr REAL    NOT NULL DEFAULT 0.0,
+        primary_vector           TEXT    NOT NULL DEFAULT 'UPI Payment Fraud'
     )
     """,
 )
@@ -296,6 +315,8 @@ INDEX_DDL: Tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_fraud_vector ON fraud_records (scam_vector_type)",
     "CREATE INDEX IF NOT EXISTS idx_fraud_published ON fraud_records (publish_timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_fraud_tier ON fraud_records (source_tier)",
+    "CREATE INDEX IF NOT EXISTS idx_fraud_isolated ON fraud_records (is_isolated_incident)",
+    "CREATE INDEX IF NOT EXISTS idx_baseline_state ON state_baselines (state_name)",
 )
 
 EXPECTED_TABLES: Tuple[str, ...] = (
@@ -308,6 +329,7 @@ EXPECTED_TABLES: Tuple[str, ...] = (
     "demographic_risk_profiles",
     "apprehension_ledger",
     "fraud_records",
+    "state_baselines",
 )
 
 # Seed rows mapping the 7-vector tactic lattice (services/expert_feed.py).
@@ -364,11 +386,107 @@ TACTIC_SEED_ROWS: Tuple[Tuple[str, str, str], ...] = (
 )
 
 
+# National NCRB baseline model (Phase 1) — (state, annual_cases, primary_vector).
+# Approximate 'Crime in India' cyber-case anchors covering all 28 states + 8 UTs
+# so no jurisdiction ever renders a baseline zero. Loss is modelled at a flat
+# per-case average; values are an illustrative baseline, not exact NCRB figures.
+_AVG_LOSS_PER_CASE_INR: float = 250_000.0
+
+_STATE_BASELINE_ANCHORS: Tuple[Tuple[str, int, str], ...] = (
+    ("Karnataka", 21_800, "UPI Payment Fraud"),
+    ("Telangana", 18_200, "Digital Arrest"),
+    ("Uttar Pradesh", 10_700, "Phishing"),
+    ("Maharashtra", 8_100, "Investment Scam"),
+    ("Tamil Nadu", 4_100, "UPI Payment Fraud"),
+    ("Rajasthan", 3_800, "SIM Swap"),
+    ("Gujarat", 3_600, "Investment Scam"),
+    ("Madhya Pradesh", 3_200, "UPI Payment Fraud"),
+    ("Haryana", 2_900, "Digital Arrest"),
+    ("Andhra Pradesh", 2_700, "UPI Payment Fraud"),
+    ("West Bengal", 2_400, "Phishing"),
+    ("Bihar", 2_200, "UPI Payment Fraud"),
+    ("Kerala", 2_000, "Loan App Extortion"),
+    ("Odisha", 1_700, "UPI Payment Fraud"),
+    ("Punjab", 1_500, "Digital Arrest"),
+    ("Jharkhand", 1_300, "UPI Payment Fraud"),
+    ("Assam", 1_200, "Phishing"),
+    ("Chhattisgarh", 1_100, "UPI Payment Fraud"),
+    ("Uttarakhand", 900, "Digital Arrest"),
+    ("Himachal Pradesh", 700, "Phishing"),
+    ("Goa", 600, "Investment Scam"),
+    ("Delhi", 400, "Digital Arrest"),
+    ("Tripura", 300, "UPI Payment Fraud"),
+    ("Manipur", 250, "Phishing"),
+    ("Meghalaya", 220, "UPI Payment Fraud"),
+    ("Nagaland", 150, "Phishing"),
+    ("Arunachal Pradesh", 140, "UPI Payment Fraud"),
+    ("Mizoram", 120, "Phishing"),
+    ("Sikkim", 90, "UPI Payment Fraud"),
+    # Union Territories
+    ("Jammu and Kashmir", 800, "Phishing"),
+    ("Chandigarh", 500, "Digital Arrest"),
+    ("Puducherry", 300, "UPI Payment Fraud"),
+    ("Dadra and Nagar Haveli and Daman and Diu", 80, "UPI Payment Fraud"),
+    ("Andaman and Nicobar Islands", 60, "Phishing"),
+    ("Ladakh", 50, "UPI Payment Fraud"),
+    ("Lakshadweep", 20, "Phishing"),
+)
+
+
+def _build_state_baseline_rows() -> Tuple[Tuple[str, int, float, float, float, str], ...]:
+    """Expand the anchors into full seed rows with prorated weekly figures."""
+    rows: List[Tuple[str, int, float, float, float, str]] = []
+    for state, annual_cases, vector in _STATE_BASELINE_ANCHORS:
+        annual_loss: float = annual_cases * _AVG_LOSS_PER_CASE_INR
+        rows.append((
+            state, annual_cases, annual_loss,
+            round(annual_cases / 52.0, 4), round(annual_loss / 52.0, 2), vector,
+        ))
+    return tuple(rows)
+
+
+STATE_BASELINE_SEED: Tuple[Tuple[str, int, float, float, float, str], ...] = (
+    _build_state_baseline_rows()
+)
+
+# Columns added to fraud_records after its original ship (Phase 2 migration).
+_FRAUD_MIGRATION_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    ("is_isolated_incident", "INTEGER NOT NULL DEFAULT 1"),
+    ("incident_loss_inr", "REAL NOT NULL DEFAULT 0.0"),
+    ("is_macro_historical_summary", "INTEGER NOT NULL DEFAULT 0"),
+    ("macro_summary_loss_inr", "REAL NOT NULL DEFAULT 0.0"),
+)
+
+
 class RelationalStoreManager:
     """Asynchronous aiosqlite engine compiling the normalized grid schemas."""
 
     def __init__(self, database_path: Path = SQLITE_PATH) -> None:
         self.database_path: Path = database_path
+
+    async def _migrate_fraud_records(self, connection: aiosqlite.Connection) -> None:
+        """Add Phase 2 temporal columns to a pre-existing fraud_records table."""
+        cursor: aiosqlite.Cursor = await connection.execute(
+            "PRAGMA table_info(fraud_records)"
+        )
+        existing: set = {row[1] for row in await cursor.fetchall()}
+        added: bool = False
+        for column, ddl in _FRAUD_MIGRATION_COLUMNS:
+            if column not in existing:
+                await connection.execute(
+                    f"ALTER TABLE fraud_records ADD COLUMN {column} {ddl}"
+                )
+                added = True
+        if added:
+            # Backfill legacy rows: treat prior data as isolated incidents so
+            # existing financial figures remain attributed to their window.
+            await connection.execute(
+                "UPDATE fraud_records "
+                "SET incident_loss_inr = financial_loss_inr, "
+                "    is_isolated_incident = 1 "
+                "WHERE incident_loss_inr = 0.0 AND financial_loss_inr > 0.0"
+            )
+            LOGGER.info("fraud_records migrated with Phase 2 temporal columns")
 
     async def init_schema(self) -> None:
         """Compile every table, index, and seed row inside one transaction."""
@@ -383,6 +501,7 @@ class RelationalStoreManager:
                 await connection.execute("PRAGMA synchronous=NORMAL")
                 for ddl in SCHEMA_DDL:
                     await connection.execute(ddl)
+                await self._migrate_fraud_records(connection)
                 for ddl in INDEX_DDL:
                     await connection.execute(ddl)
                 await connection.executemany(
@@ -391,12 +510,19 @@ class RelationalStoreManager:
                     "VALUES (?, ?, ?)",
                     TACTIC_SEED_ROWS,
                 )
+                await connection.executemany(
+                    "INSERT OR IGNORE INTO state_baselines "
+                    "(state_name, annual_cases, annual_loss_inr, "
+                    " prorated_weekly_cases, prorated_weekly_loss_inr, "
+                    " primary_vector) VALUES (?, ?, ?, ?, ?, ?)",
+                    STATE_BASELINE_SEED,
+                )
                 await connection.commit()
                 LOGGER.info(
                     "Relational schema compiled: %d tables, %d indexes, "
-                    "%d tactic seed rows at %s",
-                    len(SCHEMA_DDL), len(INDEX_DDL),
-                    len(TACTIC_SEED_ROWS), self.database_path,
+                    "%d tactic + %d state-baseline seed rows at %s",
+                    len(SCHEMA_DDL), len(INDEX_DDL), len(TACTIC_SEED_ROWS),
+                    len(STATE_BASELINE_SEED), self.database_path,
                 )
             except aiosqlite.Error:
                 await connection.rollback()
