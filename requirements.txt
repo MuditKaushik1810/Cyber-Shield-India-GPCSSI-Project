@@ -30,6 +30,12 @@ pdfplumber>=0.11.4
 # After install, run once:  playwright install chromium
 playwright>=1.49.0
 
+# --- Cloud-native scanned-PDF fallback (zero system binaries) ---
+# pypdfium2 ships pre-compiled PDFium wheels (no Poppler/Tesseract needed);
+# rendered pages are transcribed by Gemini Vision. Pillow backs page imaging.
+pypdfium2>=4.30.0
+Pillow>=10.0.0
+
 # --- OSINT search: SerpAPI (real Google results, no GCP-project restriction) ---
 # Provides the `serpapi` module; set SERPAPI_API_KEY in .env.
 google-search-results>=2.4.2

@@ -101,7 +101,9 @@ def _content_hash(meta: SourceMeta, record: FraudRecordExtraction) -> str:
         record.state or "",
         record.city or "",
         str(record.extracted_case_count),
-        str(record.financial_loss_inr),
+        # Phase 2 schema: financial_loss_inr was split into temporal variants.
+        str(record.incident_loss_inr),
+        str(record.macro_summary_loss_inr),
         record.publish_timestamp or "",
     ])
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()
@@ -132,19 +134,31 @@ class ResearchRepository:
                 await connection.execute("PRAGMA journal_mode=WAL")
                 for record in batch.records:
                     digest: str = _content_hash(meta, record)
+                    # Compat column: only isolated-incident losses populate the
+                    # window-aggregated financial_loss_inr; macro summaries are
+                    # retained separately so they never inflate short windows.
+                    isolated: int = 1 if record.is_isolated_incident else 0
+                    macro: int = 1 if record.is_macro_historical_summary else 0
+                    financial_loss: float = (
+                        record.incident_loss_inr if record.is_isolated_incident else 0.0
+                    )
                     cursor: aiosqlite.Cursor = await connection.execute(
                         "INSERT OR IGNORE INTO fraud_records ("
                         " source_platform, source_tier, publish_timestamp, "
                         " state, city, scam_vector_type, extracted_case_count, "
-                        " financial_loss_inr, demographic_age_bracket, "
-                        " demographic_gender_ratio, demographic_profession_target, "
-                        " official_safety_advisory, source_url, content_hash) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        " financial_loss_inr, is_isolated_incident, incident_loss_inr, "
+                        " is_macro_historical_summary, macro_summary_loss_inr, "
+                        " demographic_age_bracket, demographic_gender_ratio, "
+                        " demographic_profession_target, official_safety_advisory, "
+                        " source_url, content_hash) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             meta.source_platform, meta.source_tier,
                             record.publish_timestamp, record.state, record.city,
                             record.scam_vector_type, record.extracted_case_count,
-                            record.financial_loss_inr, record.demographic_age_bracket,
+                            financial_loss, isolated, record.incident_loss_inr,
+                            macro, record.macro_summary_loss_inr,
+                            record.demographic_age_bracket,
                             record.demographic_gender_ratio,
                             record.demographic_profession_target,
                             record.official_safety_advisory, meta.source_url, digest,
@@ -221,6 +235,9 @@ def readonly_connection(database_path: Path = SQLITE_PATH) -> sqlite3.Connection
 
 
 _DATE_EXPR: str = "COALESCE(publish_timestamp, ingested_at)"
+# Phase 2: timeline modules count ONLY verified isolated incidents so that
+# cumulative macro-historical figures never inflate a short window.
+_ISOLATED_ONLY: str = "is_isolated_incident = 1"
 
 
 def geospatial_hotspots(
@@ -236,7 +253,7 @@ def geospatial_hotspots(
             f"  SUM(financial_loss_inr)   AS loss, "
             f"  COUNT(*)                  AS reports "
             f"FROM fraud_records "
-            f"WHERE state IS NOT NULL AND {_DATE_EXPR} >= ? "
+            f"WHERE state IS NOT NULL AND {_ISOLATED_ONLY} AND {_DATE_EXPR} >= ? "
             f"GROUP BY state, city "
             f"ORDER BY loss DESC",
             (cutoff,),
@@ -271,7 +288,7 @@ def demographic_matrix(
             f"  SUM(financial_loss_inr)   AS loss "
             f"FROM fraud_records "
             f"WHERE {column} IS NOT NULL AND {column} != '' "
-            f"  AND {_DATE_EXPR} >= ? "
+            f"  AND {_ISOLATED_ONLY} AND {_DATE_EXPR} >= ? "
             f"GROUP BY {column} "
             f"ORDER BY cases DESC",
             (cutoff,),
@@ -316,48 +333,100 @@ def latest_advisories(
     return [dict(row) for row in rows]
 
 
+def _window_fraction(interval: str) -> float:
+    """Fraction of a year covered by the interval (for NCRB proration)."""
+    window: timedelta = INTERVAL_WINDOWS.get(interval, INTERVAL_WINDOWS["1y"])
+    return window.days / 365.0
+
+
+# Ingestion-deficit detection: a "high baseline" state that yields effectively
+# zero live telemetry over a fixed trailing window signals a crawler gap.
+HIGH_BASELINE_ANNUAL_CASES: int = 3_000
+DEFICIT_LIVE_SHARE_THRESHOLD: float = 0.05
+DEFICIT_WINDOW_DAYS: int = 30
+
+
 def state_versus_national(
     interval: str, state: str, database_path: Path = SQLITE_PATH
 ) -> Dict[str, object]:
-    """Localized state metrics against macro national averages."""
+    """Raw live state telemetry alongside an explicit NCRB control benchmark.
+
+    NO substitution: ``live_*`` fields are the unadulterated crawler counters
+    (isolated incidents only), reported even when exactly 0. The prorated NCRB
+    figures are returned separately as ``benchmark_*`` for an honest overlay,
+    never blended into the live numbers. ``ingestion_deficit`` flags a
+    high-baseline state producing near-zero telemetry over a 30-day window.
+    """
     cutoff: str = _interval_cutoff(interval)
+    fraction: float = _window_fraction(interval)
+    deficit_cutoff: str = (
+        datetime.now(timezone.utc) - timedelta(days=DEFICIT_WINDOW_DAYS)
+    ).strftime("%Y-%m-%d %H:%M:%S")
     connection: sqlite3.Connection = readonly_connection(database_path)
     try:
-        national: sqlite3.Row = connection.execute(
-            f"SELECT COUNT(DISTINCT state) AS states, "
-            f"  SUM(extracted_case_count) AS cases, "
-            f"  SUM(financial_loss_inr)   AS loss "
-            f"FROM fraud_records "
-            f"WHERE state IS NOT NULL AND {_DATE_EXPR} >= ?",
-            (cutoff,),
-        ).fetchone()
         local: sqlite3.Row = connection.execute(
             f"SELECT SUM(extracted_case_count) AS cases, "
             f"  SUM(financial_loss_inr)   AS loss, "
             f"  COUNT(*)                  AS reports "
             f"FROM fraud_records "
-            f"WHERE state = ? AND {_DATE_EXPR} >= ?",
+            f"WHERE state = ? AND {_ISOLATED_ONLY} AND {_DATE_EXPR} >= ?",
             (state, cutoff),
+        ).fetchone()
+        deficit_row: sqlite3.Row = connection.execute(
+            f"SELECT SUM(extracted_case_count) AS cases "
+            f"FROM fraud_records "
+            f"WHERE state = ? AND {_ISOLATED_ONLY} AND {_DATE_EXPR} >= ?",
+            (state, deficit_cutoff),
+        ).fetchone()
+        baseline: Optional[sqlite3.Row] = connection.execute(
+            "SELECT annual_cases, annual_loss_inr, primary_vector "
+            "FROM state_baselines WHERE state_name = ?",
+            (state,),
+        ).fetchone()
+        national: sqlite3.Row = connection.execute(
+            "SELECT AVG(annual_cases) AS avg_cases, "
+            "  AVG(annual_loss_inr) AS avg_loss FROM state_baselines"
         ).fetchone()
     except sqlite3.Error:
         LOGGER.exception("state_versus_national query failed")
         return {}
     finally:
         connection.close()
-    state_count: int = int(national["states"] or 0)
-    nat_cases: int = int(national["cases"] or 0)
-    nat_loss: float = float(national["loss"] or 0.0)
-    avg_cases: float = nat_cases / state_count if state_count else 0.0
-    avg_loss: float = nat_loss / state_count if state_count else 0.0
+
+    # Raw live telemetry — never substituted, may legitimately be 0.
+    live_cases: int = int(local["cases"] or 0)
+    live_loss: float = float(local["loss"] or 0.0)
+    reports: int = int(local["reports"] or 0)
+
+    # Explicit NCRB control benchmark, prorated to the same window.
+    annual_cases: int = int(baseline["annual_cases"]) if baseline else 0
+    annual_loss: float = float(baseline["annual_loss_inr"]) if baseline else 0.0
+    benchmark_cases: float = round(annual_cases * fraction, 1)
+    benchmark_loss: float = round(annual_loss * fraction, 2)
+    nat_avg_cases: float = round(float(national["avg_cases"] or 0.0) * fraction, 1)
+    nat_avg_loss: float = round(float(national["avg_loss"] or 0.0) * fraction, 2)
+
+    # Ingestion-deficit health check over a fixed 30-day trailing window.
+    live_30d: int = int(deficit_row["cases"] or 0)
+    expected_30d: float = annual_cases * (DEFICIT_WINDOW_DAYS / 365.0)
+    ingestion_deficit: bool = (
+        annual_cases >= HIGH_BASELINE_ANNUAL_CASES
+        and expected_30d > 0
+        and live_30d < DEFICIT_LIVE_SHARE_THRESHOLD * expected_30d
+    )
+
     return {
         "state": state,
-        "state_cases": int(local["cases"] or 0),
-        "state_loss": float(local["loss"] or 0.0),
-        "state_reports": int(local["reports"] or 0),
-        "national_avg_cases": round(avg_cases, 2),
-        "national_avg_loss": round(avg_loss, 2),
-        "national_total_cases": nat_cases,
-        "national_total_loss": nat_loss,
+        "live_cases": live_cases,
+        "live_loss": live_loss,
+        "live_reports": reports,
+        "benchmark_cases": benchmark_cases,
+        "benchmark_loss": benchmark_loss,
+        "national_avg_cases": nat_avg_cases,
+        "national_avg_loss": nat_avg_loss,
+        "annual_cases": annual_cases,
+        "primary_vector": str(baseline["primary_vector"]) if baseline else "—",
+        "ingestion_deficit": ingestion_deficit,
     }
 
 
@@ -375,7 +444,7 @@ def scam_vector_landscape(
             f"  COUNT(*)                  AS reports "
             f"FROM fraud_records "
             f"WHERE scam_vector_type IS NOT NULL AND scam_vector_type != '' "
-            f"  AND {_DATE_EXPR} >= ? "
+            f"  AND {_ISOLATED_ONLY} AND {_DATE_EXPR} >= ? "
             f"GROUP BY scam_vector_type "
             f"ORDER BY loss DESC",
             (cutoff,),
@@ -389,12 +458,20 @@ def scam_vector_landscape(
 
 
 def distinct_states(database_path: Path = SQLITE_PATH) -> List[str]:
-    """All states present in the corpus, for the state-tracker selector."""
+    """Full national state/UT list for the tracker selector.
+
+    Drawn from the NCRB baseline registry (all 28 states + 8 UTs) unioned with
+    any live-crawled states, so every jurisdiction is selectable even before it
+    has been crawled — the tracker then renders the prorated NCRB fallback.
+    """
     connection: sqlite3.Connection = readonly_connection(database_path)
     try:
         rows: List[sqlite3.Row] = connection.execute(
-            "SELECT DISTINCT state FROM fraud_records "
-            "WHERE state IS NOT NULL AND state != '' ORDER BY state"
+            "SELECT state_name AS state FROM state_baselines "
+            "UNION "
+            "SELECT state FROM fraud_records "
+            "WHERE state IS NOT NULL AND state != '' "
+            "ORDER BY state"
         ).fetchall()
     except sqlite3.Error:
         LOGGER.exception("distinct_states query failed")

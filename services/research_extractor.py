@@ -71,10 +71,22 @@ class FraudRecordExtraction(BaseModel):
     extracted_case_count: int = Field(
         default=0, ge=0,
         description="Number of cases/victims explicitly cited, else 0.")
-    financial_loss_inr: float = Field(
+    is_isolated_incident: bool = Field(
+        default=False,
+        description="True ONLY if the figure describes a single specific "
+                    "case/event (e.g. 'a resident lost Rs 5 lakh yesterday').")
+    incident_loss_inr: float = Field(
         default=0.0, ge=0.0,
-        description="Total financial loss in INR (convert lakh/crore to a "
-                    "plain rupee figure), else 0.0.")
+        description="INR lost in THIS isolated incident; 0 if not isolated. "
+                    "Convert lakh/crore to a plain rupee figure.")
+    is_macro_historical_summary: bool = Field(
+        default=False,
+        description="True if the figure is a cumulative/aggregate total over "
+                    "a long period (e.g. 'victims lost Rs 300 cr since 2023').")
+    macro_summary_loss_inr: float = Field(
+        default=0.0, ge=0.0,
+        description="INR cumulative total for a macro summary; 0 if isolated. "
+                    "Convert lakh/crore to a plain rupee figure.")
     demographic_age_bracket: Optional[str] = Field(
         default=None,
         description="Targeted age band, e.g. '18-25', '60+', 'senior citizens'.")
@@ -92,7 +104,7 @@ class FraudRecordExtraction(BaseModel):
         default=None,
         description="Publication/report date in ISO YYYY-MM-DD if stated.")
 
-    @field_validator("financial_loss_inr")
+    @field_validator("incident_loss_inr", "macro_summary_loss_inr")
     @classmethod
     def clamp_loss(cls, value: float) -> float:
         """Guard against absurd overflow figures from hallucination."""
@@ -124,11 +136,26 @@ SYSTEM_DIRECTIVE: str = (
     "loss figures, case counts, or demographics. Unknown fields stay null/0.\n"
     "2. Convert Indian currency phrasing precisely: 'Rs 5 lakh' -> 500000, "
     "'2.5 crore' -> 25000000.\n"
-    "3. Emit one record per distinct (state, scam vector) combination the "
+    "3. TEMPORAL CLASSIFICATION — this is critical. For every monetary figure, "
+    "decide whether it is an ISOLATED INCIDENT or a MACRO HISTORICAL SUMMARY:\n"
+    "   - ISOLATED INCIDENT: a single specific event tied to one victim/case "
+    "or a short recent window (e.g. 'A Bengaluru resident was swindled out of "
+    "Rs 5,00,000 yesterday'). Set is_isolated_incident=true, put the amount in "
+    "incident_loss_inr, and leave is_macro_historical_summary=false, "
+    "macro_summary_loss_inr=0.\n"
+    "   - MACRO HISTORICAL SUMMARY: a cumulative/aggregate total spanning "
+    "months or years or many cases (e.g. 'Victims have lost Rs 300 crore to "
+    "digital arrests since last year', 'India lost Rs 22,845 crore in 2024'). "
+    "Set is_macro_historical_summary=true, put the amount in "
+    "macro_summary_loss_inr, and leave is_isolated_incident=false, "
+    "incident_loss_inr=0.\n"
+    "   - If genuinely ambiguous, treat it as a macro summary (never inflate a "
+    "weekly window with cumulative history).\n"
+    "4. Emit one record per distinct (state, scam vector) combination the "
     "text actually describes. If the document is not about Indian cyber "
     "fraud, return an empty records list — that is the correct answer.\n"
-    "4. Summarize any official safety guidance faithfully and concisely.\n"
-    "5. Prefer specific scam vector names (Digital Arrest, AI Deepfake "
+    "5. Summarize any official safety guidance faithfully and concisely.\n"
+    "6. Prefer specific scam vector names (Digital Arrest, AI Deepfake "
     "Identity Theft, UPI Payment Fraud, Investment Scam, Loan App Extortion, "
     "Phishing, SIM Swap) over vague labels."
 )

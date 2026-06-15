@@ -209,14 +209,17 @@ class RagService:
     async def retrieve(
         self, query: str, filters: Optional[Dict[str, str]] = None
     ) -> List[RetrievedChunk]:
-        """Search both collections concurrently; keep the global top-K."""
+        """Search every collection and keep the global top-K.
+
+        Queried in-thread: ChromaDB's local persistent client is not reliably
+        usable across the asyncio thread pool (it raises a tenant-connection
+        error), and local cosine lookups are fast enough to run inline.
+        """
         try:
-            batches: List[List[RetrievedChunk]] = list(await asyncio.gather(
-                *(
-                    asyncio.to_thread(self._query_collection, name, query, filters)
-                    for name in RAG_COLLECTIONS
-                )
-            ))
+            batches: List[List[RetrievedChunk]] = [
+                self._query_collection(name, query, filters)
+                for name in RAG_COLLECTIONS
+            ]
         except (ValueError, KeyError):
             LOGGER.exception("Vector retrieval anomaly for query=%r", query[:80])
             return []
@@ -342,6 +345,28 @@ async def generate_response(
 ) -> Dict[str, object]:
     """Asynchronous inference controller entrypoint (Step 4.2 contract)."""
     return await get_rag_service().generate_response(query, filters)
+
+
+async def relaxed_search(query: str, k: int = 5) -> List[Dict[str, object]]:
+    """Ungated cosine-similarity fallback over the global corpus.
+
+    Strips all strict metadata/time filters and the grounding-distance gate,
+    returning the top conceptual matches regardless of distance. Used by the
+    Semantic Explorer when a strict query yields zero database rows.
+    """
+    service: RagService = get_rag_service()
+    chunks: List[RetrievedChunk] = await service.retrieve(query)
+    return [
+        {
+            "text": chunk.text,
+            "source": chunk.source,
+            "date_published": chunk.date_published,
+            "threat_category": chunk.threat_category,
+            "collection": chunk.collection,
+            "distance": round(chunk.distance, 4),
+        }
+        for chunk in chunks[:k]
+    ]
 
 
 # --------------------------------------------------------------------------- #

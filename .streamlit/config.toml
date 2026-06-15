@@ -7,6 +7,9 @@ font = "sans serif"
 
 [server]
 headless = true
+# Prevents Streamlit from watching and triggering lazy-imports inside your dependencies
+folderWatchBlacklist = [".*/site-packages/.*", ".*/venv/.*"]
 
 [browser]
 gatherUsageStats = false
+

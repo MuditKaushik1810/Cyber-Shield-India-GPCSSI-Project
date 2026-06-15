@@ -81,6 +81,22 @@ except ImportError:
 
 _PDFPLUMBER_AVAILABLE: bool = importlib.util.find_spec("pdfplumber") is not None
 
+# Cloud-native scanned-PDF fallback: pypdfium2 (pre-compiled PDFium wheels, no
+# system binaries) renders pages in-memory; Gemini Vision transcribes them.
+_PDFIUM_AVAILABLE: bool = importlib.util.find_spec("pypdfium2") is not None
+VISION_MIN_CHARS: int = 100         # below this, treat the PDF as scanned
+VISION_RENDER_SCALE: float = 2.5    # ~180 DPI page render for legibility
+VISION_MAX_PAGES: int = 5           # cap pages sent to the multimodal model
+VISION_MODEL_NAME: str = "gemini-2.5-flash"  # multimodal; project standard
+VISION_PROMPT: str = (
+    "You are an expert digital forensics document parser. The attached "
+    "image(s) represent pages from a scanned Indian state law enforcement "
+    "cyber advisory or public circular. Please transcribe all text visible "
+    "across these pages with absolute literal accuracy. Retain all names, "
+    "bank account numbers, case figures, and specific fraud tactics. Output "
+    "only the clean, raw text transcription."
+)
+
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
 LOG_DIR: Path = PROJECT_ROOT / "logs"
 
@@ -120,7 +136,8 @@ MAX_DYNAMIC_DOCS: int = 30                # per-run document cap (cost control)
 # site: queries per sweep rather than one query per domain.
 SERP_NUM_RESULTS: int = 10
 SERP_PACING_SECONDS: float = 0.5
-MAX_SITES_PER_BUNDLE: int = 6
+MAX_SITES_PER_BUNDLE: int = 10  # larger bundles keep the national footprint
+                                # within a handful of SerpAPI searches per sweep
 SERP_LOCALE: Dict[str, str] = {"gl": "in", "hl": "en"}
 
 # Playwright navigation budget.
@@ -167,14 +184,28 @@ SITE_FOOTPRINT: Dict[str, Tuple[str, Tuple[str, ...]]] = {
             "csk.gov.in", "mha.gov.in", "rbi.org.in", "bprd.nic.in",
         ),
     ),
-    # --- State & local enforcement cyber cells ------------------------------
+    # --- State & local enforcement cyber cells (national footprint) ---------
     "StateCell": (
-        "cyber crime alert advisory India",
+        "cyber crime fraud alert advisory",
         (
-            "cyber.delhipolice.gov.in", "delhipolice.gov.in", "gurugram.gov.in",
-            "haryanapolice.gov.in", "mahacyber.gov.in", "mhcyber.gov.in",
-            "goapolice.gov.in", "gujaratcybercrime.org", "ksp.karnataka.gov.in",
-            "uppolice.gov.in", "cyberpolice.nic.in", "police.assam.gov.in",
+            # Existing core
+            "delhipolice.gov.in", "haryanapolice.gov.in", "mahacyber.gov.in",
+            # All states
+            "appolice.gov.in", "arunpol.nic.in", "police.assam.gov.in",
+            "biharpolice.bihar.gov.in", "cgpolice.gov.in", "goapolice.gov.in",
+            "cidcrime.gujarat.gov.in", "gujaratpolice.gov.in", "hppolice.gov.in",
+            "jhpolice.gov.in", "cybercrime.cidkarnataka.gov.in",
+            "karnatakapolice.gov.in", "cyberdome.kerala.gov.in",
+            "keralapolice.gov.in", "mppolice.gov.in", "manipurpolice.gov.in",
+            "megpolice.gov.in", "police.mizoram.gov.in", "nagalandpolice.gov.in",
+            "odishapolice.gov.in", "punjabpolice.gov.in", "police.rajasthan.gov.in",
+            "sikkimpolice.nic.in", "tnpolice.gov.in", "tgccb.telangana.gov.in",
+            "tspolice.gov.in", "tripurapolice.gov.in",
+            "uttarakhandpolice.uk.gov.in", "wbpolice.gov.in",
+            # Union Territories
+            "police.andaman.gov.in", "chandigarhpolice.gov.in", "ddshpolice.gov.in",
+            "jkpolice.gov.in", "police.ladakh.gov.in", "lakshadweeppolice.gov.in",
+            "police.py.gov.in",
         ),
     ),
     # --- Targeted cyber security research nodes -----------------------------
@@ -232,18 +263,99 @@ async def _fetch(client: httpx.AsyncClient, url: str) -> Optional[httpx.Response
     return None
 
 
-def _parse_pdf(content: bytes) -> str:
-    """Extract text from PDF bytes via pdfplumber (empty string on failure)."""
-    if not _PDFPLUMBER_AVAILABLE:
-        LOGGER.warning("pdfplumber unavailable — PDF skipped")
-        return ""
+def _render_pdf_pages(content: bytes) -> List[bytes]:
+    """Render PDF pages to in-memory JPEG bytes via pypdfium2 (no system deps).
+
+    pypdfium2 bundles pre-compiled PDFium binaries inside its wheel, so this
+    works in sandboxed environments with zero host-level dependencies.
+    """
+    if not _PDFIUM_AVAILABLE:
+        LOGGER.warning("pypdfium2 not installed — cannot render scanned PDF")
+        return []
+    import pypdfium2 as pdfium
+    pages: List[bytes] = []
     try:
-        import pdfplumber
-        with pdfplumber.open(io.BytesIO(content)) as pdf:
-            return "\n".join((page.extract_text() or "") for page in pdf.pages)
-    except _PDF_ERRORS:
-        LOGGER.exception("PDF parse failed")
+        document = pdfium.PdfDocument(content)
+    except (pdfium.PdfiumError, ValueError, OSError):
+        LOGGER.exception("pypdfium2 failed to load PDF")
+        return []
+    try:
+        page_count: int = min(len(document), VISION_MAX_PAGES)
+        for index in range(page_count):
+            bitmap = document[index].render(scale=VISION_RENDER_SCALE)
+            image = bitmap.to_pil().convert("RGB")
+            buffer: io.BytesIO = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=85)
+            pages.append(buffer.getvalue())
+    except (pdfium.PdfiumError, ValueError, OSError):
+        LOGGER.exception("pypdfium2 page render failed")
+    finally:
+        document.close()
+    LOGGER.info("Rendered %d page image(s) for vision transcription", len(pages))
+    return pages
+
+
+def _extract_text_via_vision(image_pages: List[bytes]) -> str:
+    """Transcribe rendered page images through the Gemini Vision model."""
+    if not image_pages:
         return ""
+    import base64
+    from langchain_core.messages import HumanMessage
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    from langchain_google_genai._common import GoogleGenerativeAIError
+    from core.config import get_google_api_key
+
+    content: List[Dict[str, str]] = [{"type": "text", "text": VISION_PROMPT}]
+    for jpeg in image_pages:
+        encoded: str = base64.b64encode(jpeg).decode("ascii")
+        content.append({
+            "type": "image_url",
+            "image_url": f"data:image/jpeg;base64,{encoded}",
+        })
+    try:
+        llm = ChatGoogleGenerativeAI(
+            model=VISION_MODEL_NAME, temperature=0.0,
+            google_api_key=get_google_api_key(),
+        )
+        response = llm.invoke([HumanMessage(content=content)])
+    except (GoogleGenerativeAIError, ValueError, RuntimeError):
+        LOGGER.exception("Gemini Vision transcription failed")
+        return ""
+    transcription: str = str(response.content).strip()
+    LOGGER.info("Gemini Vision transcribed %d chars from %d page(s)",
+                len(transcription), len(image_pages))
+    return transcription
+
+
+def _parse_pdf(content: bytes) -> str:
+    """Extract text from PDF bytes; Gemini Vision fallback for scanned PDFs.
+
+    pdfplumber handles native-text PDFs. When it yields fewer than
+    ``VISION_MIN_CHARS`` characters (a scanned image or unreadable embedded
+    fonts), pages are rendered with pypdfium2 and transcribed by Gemini Vision
+    — a fully cloud-native fallback with no host-level binary dependencies.
+    """
+    text: str = ""
+    if _PDFPLUMBER_AVAILABLE:
+        try:
+            import pdfplumber
+            with pdfplumber.open(io.BytesIO(content)) as pdf:
+                text = "\n".join((page.extract_text() or "") for page in pdf.pages)
+        except _PDF_ERRORS:
+            LOGGER.exception("pdfplumber parse failed")
+            text = ""
+    else:
+        LOGGER.warning("pdfplumber unavailable — relying on vision fallback")
+
+    if len(text.strip()) >= VISION_MIN_CHARS:
+        return text
+
+    LOGGER.warning("⚠️ Scanned document detected. Engaging cloud-native "
+                   "Gemini Vision Multimodal Fallback...")
+    image_pages: List[bytes] = _render_pdf_pages(content)
+    vision_text: str = _extract_text_via_vision(image_pages)
+    # Hand back the vision transcription when productive, else the minimal text.
+    return vision_text if vision_text.strip() else text
 
 
 def _html_to_text(html: str) -> str:
@@ -533,18 +645,22 @@ async def seed_demo() -> int:
                     f"demo|{row['state']}|{row['city']}|{row['scam_vector_type']}"
                     .encode("utf-8")
                 ).hexdigest()
+                loss: float = float(row["financial_loss_inr"])  # type: ignore[arg-type]
                 cursor: aiosqlite.Cursor = await connection.execute(
                     "INSERT OR IGNORE INTO fraud_records ("
                     " source_platform, source_tier, publish_timestamp, state, city, "
                     " scam_vector_type, extracted_case_count, financial_loss_inr, "
+                    " is_isolated_incident, incident_loss_inr, "
+                    " is_macro_historical_summary, macro_summary_loss_inr, "
                     " demographic_age_bracket, demographic_gender_ratio, "
                     " demographic_profession_target, official_safety_advisory, "
                     " source_url, content_hash) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         "demo_sample", "demo", published, row["state"], row["city"],
                         row["scam_vector_type"], row["extracted_case_count"],
-                        row["financial_loss_inr"], row["demographic_age_bracket"],
+                        loss, 1, loss, 0, 0.0,
+                        row["demographic_age_bracket"],
                         row["demographic_gender_ratio"],
                         row["demographic_profession_target"], row["advisory"],
                         None, digest,
