@@ -26,6 +26,7 @@ daily into ``logs/rag.log``.
 """
 
 import asyncio
+import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -88,7 +89,8 @@ TOP_K: int = 4
 # Cosine distance ceiling: retrieval hits farther than this are not
 # considered official grounding and trigger the deterministic fallback.
 MAX_GROUNDING_DISTANCE: float = 0.70
-GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
+from core.config import GEMINI_FLASH_MODEL as _FLASH
+GEMINI_MODEL_NAME: str = _FLASH
 INFERENCE_TIMEOUT_SECONDS: float = 90.0
 
 RAG_COLLECTIONS: tuple = (
@@ -464,6 +466,96 @@ def _build_combined_context(
     return "\n\n---\n\n".join(blocks)
 
 
+WEB_SEED_COLLECTION: str = "research_corpus"
+WEB_SEED_DATE: str = "2026-06-16"
+
+# Keyword domain classifier for write-through tags (deterministic, no LLM cost;
+# the synthesis already consumes a Flash call). Specific domains checked first.
+_DOMAIN_KEYWORDS: Dict[str, tuple] = {
+    "Data Leak": ("data leak", "data breach", "records exposed", "leaked",
+                  "breach", "database exposed"),
+    "Deepfake/Extortion": ("deepfake", "extortion", "sextortion", "blackmail",
+                           "morphed", "ai-generated"),
+    "MITM/Infrastructure": ("man-in-the-middle", "mitm", "router", "dns",
+                            "interception", "rogue wifi", "infrastructure"),
+    "Phishing/Spam": ("phishing", "smishing", "vishing", "spam", "fake link"),
+    "Financial Fraud": ("upi", "fraud", "scam", "loan", "investment",
+                        "digital arrest", "otp", "bank", "money"),
+}
+
+
+def detect_threat_domain(text: str) -> str:
+    """Lightweight keyword classifier for a web snippet's threat domain."""
+    lowered: str = text.lower()
+    for domain in ("Data Leak", "Deepfake/Extortion", "MITM/Infrastructure",
+                   "Phishing/Spam", "Financial Fraud"):
+        if any(keyword in lowered for keyword in _DOMAIN_KEYWORDS[domain]):
+            return domain
+    return "Financial Fraud"
+
+
+def _web_chunk_id(url: str, title: str) -> str:
+    """Deterministic chunk id from the URL (or title) for dedup."""
+    basis: str = (url or title).strip().lower()
+    return f"web-seed-{hashlib.sha256(basis.encode('utf-8')).hexdigest()[:20]}"
+
+
+def writethrough_web_chunks(web_results: List[Dict[str, str]]) -> int:
+    """Write-through: ingest web snippets into ChromaDB, deduped by URL hash.
+
+    Tags each chunk with source_platform='Web-Seeded: Explorer', the detected
+    threat_category, and date_ingested. Returns the count newly written.
+    Idempotent across reruns — existing URL-hash ids are skipped.
+    """
+    if not web_results:
+        return 0
+    candidates: Dict[str, Dict[str, str]] = {}
+    for result in web_results:
+        title: str = str(result.get("title") or "")
+        snippet: str = str(result.get("snippet") or "")
+        url: str = str(result.get("link") or result.get("url") or "")
+        body: str = " ".join(p for p in (title, snippet) if p).strip()
+        if len(body) < 20:
+            continue
+        candidates[_web_chunk_id(url, title)] = {
+            "id": _web_chunk_id(url, title), "text": body, "url": url,
+            "domain": detect_threat_domain(body),
+        }
+    if not candidates:
+        return 0
+    try:
+        collection = get_rag_service()._vector_store.get_collection(
+            WEB_SEED_COLLECTION)
+        existing: Dict[str, object] = collection.get(ids=list(candidates))
+        existing_ids: set = set(existing.get("ids", []))  # type: ignore[arg-type]
+        fresh: List[Dict[str, str]] = [
+            c for cid, c in candidates.items() if cid not in existing_ids
+        ]
+        if not fresh:
+            LOGGER.info("write-through: all %d web chunks already present",
+                        len(candidates))
+            return 0
+        collection.add(
+            ids=[c["id"] for c in fresh],
+            documents=[c["text"] for c in fresh],
+            metadatas=[{
+                "source": "Web-Seeded: Explorer",
+                "source_platform": "Web-Seeded: Explorer",
+                "threat_category": c["domain"],
+                "url": c["url"],
+                "date_published": WEB_SEED_DATE,
+                "date_ingested": WEB_SEED_DATE,
+                "state": "",
+            } for c in fresh],
+        )
+    except (ValueError, KeyError, RuntimeError):
+        LOGGER.exception("write-through web ingest failed")
+        return 0
+    LOGGER.info("write-through: ingested %d new web chunk(s) into %s",
+                len(fresh), WEB_SEED_COLLECTION)
+    return len(fresh)
+
+
 async def synthesize_answer(
     query: str, k: int = 5, allow_web: bool = True
 ) -> Dict[str, object]:
@@ -484,6 +576,10 @@ async def synthesize_answer(
     web_results: List[Dict[str, str]] = []
     if allow_web and needs_web_augmentation(query, top):
         web_results = await asyncio.to_thread(web_search, query)
+        if web_results:
+            # Write-through cache: ingest the fresh web snippets into ChromaDB
+            # (deduped) so future queries are served from the local corpus.
+            await asyncio.to_thread(writethrough_web_chunks, web_results)
 
     if not top and not web_results:
         return {"answer": None, "citations": [], "matches": [],

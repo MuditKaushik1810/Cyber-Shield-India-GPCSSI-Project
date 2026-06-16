@@ -271,8 +271,15 @@ SCHEMA_DDL: Tuple[str, ...] = (
         state                         TEXT,
         city                          TEXT,
         scam_vector_type              TEXT,
+        -- Unified threat-domain taxonomy (financial + non-financial).
+        threat_domain                 TEXT    NOT NULL DEFAULT 'Financial Fraud',
         extracted_case_count          INTEGER NOT NULL DEFAULT 0,
         financial_loss_inr            REAL    NOT NULL DEFAULT 0.0,
+        -- Optional non-monetary impact metrics (nullable; never break the
+        -- existing financial summaries).
+        records_exposed               INTEGER,
+        incident_count                INTEGER,
+        severity_level                TEXT,
         -- Temporal classification (Phase 2): isolated case vs macro summary.
         is_isolated_incident          INTEGER NOT NULL DEFAULT 1,
         incident_loss_inr             REAL    NOT NULL DEFAULT 0.0,
@@ -316,6 +323,7 @@ INDEX_DDL: Tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_fraud_published ON fraud_records (publish_timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_fraud_tier ON fraud_records (source_tier)",
     "CREATE INDEX IF NOT EXISTS idx_fraud_isolated ON fraud_records (is_isolated_incident)",
+    "CREATE INDEX IF NOT EXISTS idx_fraud_domain ON fraud_records (threat_domain)",
     "CREATE INDEX IF NOT EXISTS idx_baseline_state ON state_baselines (state_name)",
 )
 
@@ -449,12 +457,17 @@ STATE_BASELINE_SEED: Tuple[Tuple[str, int, float, float, float, str], ...] = (
     _build_state_baseline_rows()
 )
 
-# Columns added to fraud_records after its original ship (Phase 2 migration).
+# Columns added to fraud_records after its original ship (online migrations).
 _FRAUD_MIGRATION_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("is_isolated_incident", "INTEGER NOT NULL DEFAULT 1"),
     ("incident_loss_inr", "REAL NOT NULL DEFAULT 0.0"),
     ("is_macro_historical_summary", "INTEGER NOT NULL DEFAULT 0"),
     ("macro_summary_loss_inr", "REAL NOT NULL DEFAULT 0.0"),
+    # Unified multi-domain extension (financial + non-financial).
+    ("threat_domain", "TEXT NOT NULL DEFAULT 'Financial Fraud'"),
+    ("records_exposed", "INTEGER"),
+    ("incident_count", "INTEGER"),
+    ("severity_level", "TEXT"),
 )
 
 

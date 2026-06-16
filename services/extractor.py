@@ -252,7 +252,8 @@ SYSTEM_DIRECTIVE: str = (
     "6. Dates must be ISO YYYY-MM-DD and only when stated in the text."
 )
 
-GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
+from core.config import GEMINI_FLASH_MODEL as _FLASH
+GEMINI_MODEL_NAME: str = _FLASH
 EXTRACTION_TIMEOUT_SECONDS: float = 90.0
 BATCH_CONCURRENCY: int = 4
 

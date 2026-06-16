@@ -142,21 +142,32 @@ class ResearchRepository:
                     financial_loss: float = (
                         record.incident_loss_inr if record.is_isolated_incident else 0.0
                     )
+                    # New multi-domain fields are optional; getattr keeps
+                    # backward compatibility with any older extraction objects.
+                    threat_domain: str = getattr(
+                        record, "threat_domain", "Financial Fraud")
+                    records_exposed = getattr(record, "records_exposed", None)
+                    incident_count = getattr(record, "incident_count", None)
+                    severity_level = getattr(record, "severity_level", None)
                     cursor: aiosqlite.Cursor = await connection.execute(
                         "INSERT OR IGNORE INTO fraud_records ("
                         " source_platform, source_tier, publish_timestamp, "
-                        " state, city, scam_vector_type, extracted_case_count, "
-                        " financial_loss_inr, is_isolated_incident, incident_loss_inr, "
+                        " state, city, scam_vector_type, threat_domain, "
+                        " extracted_case_count, financial_loss_inr, "
+                        " records_exposed, incident_count, severity_level, "
+                        " is_isolated_incident, incident_loss_inr, "
                         " is_macro_historical_summary, macro_summary_loss_inr, "
                         " demographic_age_bracket, demographic_gender_ratio, "
                         " demographic_profession_target, official_safety_advisory, "
                         " source_url, content_hash) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             meta.source_platform, meta.source_tier,
                             record.publish_timestamp, record.state, record.city,
-                            record.scam_vector_type, record.extracted_case_count,
-                            financial_loss, isolated, record.incident_loss_inr,
+                            record.scam_vector_type, threat_domain,
+                            record.extracted_case_count, financial_loss,
+                            records_exposed, incident_count, severity_level,
+                            isolated, record.incident_loss_inr,
                             macro, record.macro_summary_loss_inr,
                             record.demographic_age_bracket,
                             record.demographic_gender_ratio,
@@ -497,6 +508,51 @@ def distinct_states(database_path: Path = SQLITE_PATH) -> List[str]:
     finally:
         connection.close()
     return [str(row["state"]) for row in rows]
+
+
+def domain_kpis(
+    interval: str, exclude_demo: bool = False, database_path: Path = SQLITE_PATH
+) -> Dict[str, object]:
+    """Unified financial + non-financial KPIs across all threat domains.
+
+    Returns headline totals (financial loss, records exposed, incidents,
+    active domains) plus a per-domain breakdown — all in one continuous read
+    so financial and non-financial metrics render together without a toggle.
+    """
+    cutoff: str = _interval_cutoff(interval)
+    demo: str = _demo_clause(exclude_demo)
+    connection: sqlite3.Connection = readonly_connection(database_path)
+    try:
+        totals: sqlite3.Row = connection.execute(
+            f"SELECT SUM(financial_loss_inr) AS loss, "
+            f"  SUM(records_exposed) AS records, "
+            f"  SUM(incident_count) AS incidents, "
+            f"  COUNT(DISTINCT threat_domain) AS domains "
+            f"FROM fraud_records "
+            f"WHERE {_ISOLATED_ONLY} {demo}AND {_DATE_EXPR} >= ?",
+            (cutoff,),
+        ).fetchone()
+        rows: List[sqlite3.Row] = connection.execute(
+            f"SELECT threat_domain AS domain, COUNT(*) AS n, "
+            f"  SUM(financial_loss_inr) AS loss, "
+            f"  SUM(records_exposed) AS records "
+            f"FROM fraud_records "
+            f"WHERE {_ISOLATED_ONLY} {demo}AND {_DATE_EXPR} >= ? "
+            f"GROUP BY threat_domain ORDER BY n DESC",
+            (cutoff,),
+        ).fetchall()
+    except sqlite3.Error:
+        LOGGER.exception("domain_kpis query failed")
+        return {}
+    finally:
+        connection.close()
+    return {
+        "financial_loss": float(totals["loss"] or 0.0),
+        "records_exposed": int(totals["records"] or 0),
+        "incidents": int(totals["incidents"] or 0),
+        "active_domains": int(totals["domains"] or 0),
+        "by_domain": [dict(row) for row in rows],
+    }
 
 
 def corpus_size(database_path: Path = SQLITE_PATH) -> int:

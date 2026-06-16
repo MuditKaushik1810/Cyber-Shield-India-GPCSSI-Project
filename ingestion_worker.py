@@ -88,7 +88,8 @@ _PDFIUM_AVAILABLE: bool = importlib.util.find_spec("pypdfium2") is not None
 VISION_MIN_CHARS: int = 100         # below this, treat the PDF as scanned
 VISION_RENDER_SCALE: float = 2.5    # ~180 DPI page render for legibility
 VISION_MAX_PAGES: int = 5           # cap pages sent to the multimodal model
-VISION_MODEL_NAME: str = "gemini-2.5-flash"  # multimodal; project standard
+from core.config import GEMINI_FLASH_MODEL as _FLASH
+VISION_MODEL_NAME: str = _FLASH  # multimodal; centralized Flash model
 VISION_PROMPT: str = (
     "You are an expert digital forensics document parser. The attached "
     "image(s) represent pages from a scanned Indian state law enforcement "

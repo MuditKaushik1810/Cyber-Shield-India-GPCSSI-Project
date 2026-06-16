@@ -113,6 +113,16 @@ TERMINAL_CSS: str = """
     background: #F0F7FC; color: #1F2937; font-size: 0.92rem; line-height: 1.5;
 }
 .cs-briefing b { color: #0A74B9; letter-spacing: 0.08em; }
+.cs-webbadge {
+    display: inline-block; background: #0A74B9; color: #FFFFFF;
+    font-size: 0.64rem; font-weight: 700; letter-spacing: 0.08em;
+    border-radius: 999px; padding: 2px 9px; margin-bottom: 4px;
+}
+.cs-domainchip {
+    display: inline-block; background: #E8F1F8; color: #0F2537;
+    border: 1px solid #C7DCEC; font-size: 0.72rem; font-weight: 600;
+    border-radius: 999px; padding: 2px 10px; margin: 2px 3px;
+}
 /* Contrast patch: navy theme darkens inputs; force readable field text. */
 .stTextInput input, .stTextArea textarea {
     background-color: #FFFFFF !important; color: #1F2937 !important;
@@ -228,6 +238,80 @@ def cached_briefing(interval: str, exclude_demo: bool, day: str) -> str:
     return generate_briefing(stats, interval)
 
 
+# Zero-state web-seeding (cached 1 hour to avoid re-billing SerpAPI/Gemini).
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_web_advisories(scam_type: str, day: str) -> List[Dict[str, str]]:
+    """Live web-sourced advisory cards for an empty advisory panel."""
+    from services.web_seed import web_sourced_advisories
+    return web_sourced_advisories(scam_type)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_regional_insight(label: str, day: str) -> Dict[str, object]:
+    """Live web-augmented threat insight for an empty chart/state."""
+    from services.web_seed import regional_insight
+    return regional_insight(label)
+
+
+ZERO_STATE_MESSAGE: str = "No active telemetry records captured for this filter window."
+
+
+def render_web_advisories(scam_type: str) -> bool:
+    """Render live web-sourced advisory cards; True if any were rendered."""
+    from services.web_seed import web_seed_available
+    if not web_seed_available():
+        return False
+    with st.spinner("Seeding live advisories from the web…"):
+        cards: List[Dict[str, str]] = cached_web_advisories(
+            scam_type or "cyber fraud", _cache_day())
+    if not cards:
+        return False
+    for card in cards:
+        url: str = str(card.get("url") or "")
+        link: str = (f"<br>🔗 <a href='{url}' target='_blank'>Source</a>"
+                     if url else "")
+        st.markdown(
+            f"""<div class="cs-advisory">
+            <span class="cs-webbadge">🌐 Live Web Sourced</span>
+            <b>{card.get('title', '')}</b><br>
+            {card.get('description', '')}{link}</div>""",
+            unsafe_allow_html=True,
+        )
+    return True
+
+
+def render_insight_panel(label: str) -> None:
+    """Swap a broken empty chart for a live LLM Analytical Insight Panel."""
+    from services.web_seed import web_seed_available
+    if not web_seed_available():
+        st.info(ZERO_STATE_MESSAGE)
+        return
+    with st.spinner(f"Synthesizing live web intelligence for {label}…"):
+        insight: Dict[str, object] = cached_regional_insight(label, _cache_day())
+    if not insight or not insight.get("summary"):
+        st.info(ZERO_STATE_MESSAGE)
+        return
+    st.markdown(
+        f"""<div class="cs-briefing">🌐 <b>LLM ANALYTICAL INSIGHT</b>
+        &nbsp;·&nbsp; {label} &nbsp;·&nbsp; Live Web-Augmented</div>""",
+        unsafe_allow_html=True,
+    )
+    body_col, metric_col = st.columns([3, 1])
+    with body_col:
+        st.markdown(str(insight.get("summary", "")))
+    with metric_col:
+        st.metric("Live Web-Augmented Estimate", str(insight.get("estimate", "—")))
+        st.caption(f"Threat level: {insight.get('threat_level', '—')}")
+    sources: List[Dict[str, str]] = insight.get("sources", [])  # type: ignore[assignment]
+    if sources:
+        with st.expander("🔗 Web sources"):
+            for src in sources:
+                src_url: str = str(src.get("url") or "")
+                title: str = str(src.get("title") or src_url or "source")
+                if src_url:
+                    st.markdown(f"- [{title}]({src_url})")
+
+
 def _inr(value: float) -> str:
     """Format an INR amount into a compact crore/lakh string."""
     if value >= 1e7:
@@ -288,7 +372,9 @@ def render_geospatial(interval: str, exclude_demo: bool) -> None:
         frame["cases"] = frame["cases"].fillna(0).astype(int)
         frame = frame[(frame["cases"] > 0) | (frame["loss"] > 0)]
     if frame.empty:
-        st.info("No active telemetry records captured for this filter window.")
+        # No live hot-spots — seed a national web-augmented insight panel
+        # instead of a broken empty map canvas.
+        render_insight_panel("India cyber fraud hot-spots")
         return
 
     map_col, bar_col = st.columns([3, 2])
@@ -404,7 +490,10 @@ def render_demographic(interval: str, exclude_demo: bool) -> None:
             interval, scam_vector=chosen, limit=6
         )
         if not advisories:
-            st.info("No active telemetry records captured for this filter window.")
+            # Zero-state: seed live advisory cards from the web for this vector.
+            seed_topic: str = chosen or "cyber fraud"
+            if not render_web_advisories(seed_topic):
+                st.info(ZERO_STATE_MESSAGE)
         for advisory in advisories:
             url: str = str(advisory.get("source_url") or "")
             link_html: str = (
@@ -458,6 +547,8 @@ def render_state_tracker(interval: str, exclude_demo: bool) -> None:
             "telemetry. Verify crawler connectivity for this state's domains."
         )
 
+    live_is_zero: bool = live_cases == 0 and live_loss == 0.0
+
     if exclude_demo:
         # Pure operational view — live telemetry only, no NCRB baseline.
         st.caption("🟢 Pure operational mode — NCRB baseline overlay hidden.")
@@ -466,6 +557,10 @@ def render_state_tracker(interval: str, exclude_demo: bool) -> None:
             st.metric(f"Live cases · {window_label}", f"{live_cases:,.0f}")
         with metric_cols[1]:
             st.metric(f"Live loss · {window_label}", _inr(live_loss))
+        if live_is_zero:
+            # No live telemetry — swap the empty chart for a web insight panel.
+            render_insight_panel(f"{state} cyber crime")
+            return
         figure: go.Figure = go.Figure()
         figure.add_bar(x=["Reported cases"], y=[live_cases], name="Live captured",
                        marker={"color": "#0A74B9"})
@@ -497,6 +592,12 @@ def render_state_tracker(interval: str, exclude_demo: bool) -> None:
         with inner_b[1]:
             st.metric(f"Expected loss · {window_label}", _inr(bench_loss))
 
+    if live_is_zero:
+        # No live telemetry for this state/window — swap the empty live-vs-
+        # baseline chart for a web-augmented insight panel.
+        render_insight_panel(f"{state} cyber crime")
+        return
+
     # Live solid bar with the NCRB baseline as a dashed reference line.
     figure = go.Figure()
     figure.add_bar(x=["Reported cases"], y=[live_cases], name="Live captured",
@@ -520,6 +621,37 @@ def render_state_tracker(interval: str, exclude_demo: bool) -> None:
                    "NCRB baseline for this window.")
 
 
+def render_infrastructure_kpis(interval: str, exclude_demo: bool) -> None:
+    """Dedicated non-financial technical KPI block (records, incidents, domains).
+
+    Strictly separate from the financial dashboard above — currency never
+    appears here; the financial loss stays in the financial section.
+    """
+    kpis: Dict[str, object] = rr.domain_kpis(interval, exclude_demo)
+    if not kpis:
+        st.info(ZERO_STATE_MESSAGE)
+        return
+    cols: List[object] = st.columns(3)
+    with cols[0]:
+        st.metric("🗄️ Records Exposed", f"{int(kpis.get('records_exposed', 0)):,}")  # type: ignore[arg-type]
+    with cols[1]:
+        st.metric("🚨 Incidents", f"{int(kpis.get('incidents', 0)):,}")  # type: ignore[arg-type]
+    with cols[2]:
+        st.metric("🧭 Active Threat Domains", str(kpis.get("active_domains", 0)))
+    by_domain: List[Dict[str, object]] = kpis.get("by_domain", [])  # type: ignore[assignment]
+    if by_domain:
+        chips: str = " ".join(
+            f"<span class='cs-domainchip'>{d.get('domain', '?')} · "
+            f"{int(d.get('n', 0))}</span>"
+            for d in by_domain
+        )
+        st.markdown(f"<div style='margin:2px 0 6px 0;'>{chips}</div>",
+                    unsafe_allow_html=True)
+    st.caption("Non-financial threat-domain telemetry (data leaks, deepfakes, "
+               "phishing, MITM) populates as the ingestion worker harvests "
+               "these sources.")
+
+
 def render_macro_trends_tab(exclude_demo: bool) -> None:
     """The four analytics modules under one chronological filter."""
     st.caption("Aggregated, AI-synthesized public-domain cybercrime trends. "
@@ -538,6 +670,8 @@ def render_macro_trends_tab(exclude_demo: bool) -> None:
         &nbsp;·&nbsp; {INTERVAL_LABELS.get(interval, interval)}<br>{briefing}</div>""",
         unsafe_allow_html=True,
     )
+
+    # ===== FINANCIAL FRAUD DASHBOARD (isolated — currency only) =============
     st.divider()
     render_geospatial(interval, exclude_demo)
     st.divider()
@@ -546,6 +680,11 @@ def render_macro_trends_tab(exclude_demo: bool) -> None:
     render_demographic(interval, exclude_demo)
     st.divider()
     render_state_tracker(interval, exclude_demo)
+
+    # ===== DIGITAL & INFRASTRUCTURE THREAT INTEL (stacked beneath) ==========
+    st.divider()
+    st.markdown("### 🚨 Digital & Infrastructure Threat Intel")
+    render_infrastructure_kpis(interval, exclude_demo)
 
 
 # --------------------------------------------------------------------------- #
@@ -763,10 +902,11 @@ def _query_sandbox(question: str) -> None:
     from langchain_core.messages import HumanMessage, SystemMessage
     from langchain_google_genai import ChatGoogleGenerativeAI
     from langchain_google_genai._common import GoogleGenerativeAIError
+    from core.config import GEMINI_FLASH_MODEL as _SANDBOX_FLASH
     from core.config import get_google_api_key
     try:
         llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash", temperature=0.1,
+            model=_SANDBOX_FLASH, temperature=0.1,
             google_api_key=get_google_api_key(),
         )
         completion = llm.invoke([
