@@ -556,6 +556,51 @@ def writethrough_web_chunks(web_results: List[Dict[str, str]]) -> int:
     return len(fresh)
 
 
+def seed_relational_from_web(web_results: List[Dict[str, str]]) -> int:
+    """Parse web results into structured non-financial fraud_records rows.
+
+    Pre-dedup by URL/title hash (so reruns skip the LLM parse entirely), then
+    gemini-3.5-flash classifies each new result into the threat taxonomy and the
+    rows are INSERTed with financial fields zeroed — driving the technical
+    charts without ever touching the financial dashboard.
+    """
+    from services.research_repository import (
+        existing_web_hashes, insert_web_threat_rows, web_row_hash,
+    )
+    from services.web_seed import parse_web_threats
+
+    if not web_results:
+        return 0
+    keyed: List[tuple] = [
+        (web_row_hash(str(r.get("link") or r.get("url") or ""),
+                      str(r.get("title") or "")), r)
+        for r in web_results
+    ]
+    seen: set = existing_web_hashes([h for h, _ in keyed])
+    fresh: List[Dict[str, str]] = [r for h, r in keyed if h not in seen]
+    if not fresh:
+        LOGGER.info("relational web-seed: all results already present")
+        return 0
+    parsed = parse_web_threats(fresh)
+    rows: List[Dict[str, object]] = []
+    for record, source in zip(parsed, fresh):
+        if record.threat_domain == "Financial Fraud":
+            continue  # financial flows via the worker, never web-seed
+        rows.append({
+            "url": str(source.get("link") or source.get("url") or ""),
+            "title": str(source.get("title") or ""),
+            "threat_domain": record.threat_domain,
+            "scam_vector_type": record.scam_vector_type,
+            "state": record.state,
+            "target_sector": record.target_sector,
+            "compromised_assets": record.compromised_assets,
+            "records_exposed": record.records_exposed,
+            "incident_count": record.incident_count,
+            "severity_level": record.severity_level,
+        })
+    return insert_web_threat_rows(rows)
+
+
 async def synthesize_answer(
     query: str, k: int = 5, allow_web: bool = True
 ) -> Dict[str, object]:
@@ -577,9 +622,11 @@ async def synthesize_answer(
     if allow_web and needs_web_augmentation(query, top):
         web_results = await asyncio.to_thread(web_search, query)
         if web_results:
-            # Write-through cache: ingest the fresh web snippets into ChromaDB
-            # (deduped) so future queries are served from the local corpus.
+            # Write-through: ingest fresh web snippets into ChromaDB (deduped)
+            # AND seed structured non-financial rows into the relational store
+            # so the technical infrastructure charts update on the fly.
             await asyncio.to_thread(writethrough_web_chunks, web_results)
+            await asyncio.to_thread(seed_relational_from_web, web_results)
 
     if not top and not web_results:
         return {"answer": None, "citations": [], "matches": [],

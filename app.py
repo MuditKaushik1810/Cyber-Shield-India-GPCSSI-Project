@@ -253,6 +253,15 @@ def cached_regional_insight(label: str, day: str) -> Dict[str, object]:
     return regional_insight(label)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_playbook(
+    threat_domain: str, target_sector: str, day: str
+) -> List[Dict[str, str]]:
+    """Cached 4-point forensic triage playbook (one LLM call per combo/day)."""
+    from services.playbook import generate_triage_playbook
+    return generate_triage_playbook(threat_domain, target_sector)
+
+
 ZERO_STATE_MESSAGE: str = "No active telemetry records captured for this filter window."
 
 
@@ -652,6 +661,103 @@ def render_infrastructure_kpis(interval: str, exclude_demo: bool) -> None:
                "these sources.")
 
 
+_GATHERING_MSG: str = (
+    "⏳ Gathering live threat data… ask the Semantic Explorer about a data "
+    "breach, ransomware, or infrastructure attack to seed this section."
+)
+
+
+def render_infrastructure_charts(interval: str, exclude_demo: bool) -> None:
+    """Two-column non-financial analytics: records-by-sector + domain matrix."""
+    sectors: List[Dict[str, object]] = rr.records_by_sector(interval, exclude_demo)
+    domains: List[Dict[str, object]] = rr.incidents_by_domain(interval, exclude_demo)
+    if not sectors and not domains:
+        st.info(_GATHERING_MSG)
+        return
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**🗄️ Records Exposed by Targeted Sector**")
+        if sectors:
+            frame: pd.DataFrame = pd.DataFrame(sectors).sort_values("records")
+            fig: go.Figure = px.bar(
+                frame, x="records", y="sector", orientation="h",
+                color_discrete_sequence=["#0F2537"],
+            )
+            fig.update_layout(height=320, xaxis_title="Records exposed",
+                              yaxis_title=None,
+                              margin={"l": 0, "r": 0, "t": 10, "b": 0})
+            st.plotly_chart(fig, width="stretch")
+        else:
+            st.info(_GATHERING_MSG)
+    with right:
+        st.markdown("**🧬 Incident Volume by Threat Domain**")
+        if domains:
+            frame_d: pd.DataFrame = pd.DataFrame(domains)
+            fig_d: go.Figure = px.pie(
+                frame_d, names="domain", values="incidents", hole=0.45,
+            )
+            fig_d.update_layout(height=320,
+                                margin={"l": 0, "r": 0, "t": 10, "b": 0})
+            st.plotly_chart(fig_d, width="stretch")
+        else:
+            st.info(_GATHERING_MSG)
+
+
+def render_asset_intelligence(interval: str, exclude_demo: bool) -> None:
+    """Asset Intelligence Log + legally-aligned forensic triage playbook."""
+    st.markdown("#### 🔍 Actionable Technical Indicators & Assets")
+    log: List[Dict[str, object]] = rr.asset_log(interval, exclude_demo)
+    if not log:
+        st.info(_GATHERING_MSG)
+        return
+    frame: pd.DataFrame = pd.DataFrame(log).rename(columns={
+        "timestamp": "Timestamp", "threat_domain": "Threat Domain",
+        "target_sector": "Target Sector", "compromised_assets": "Compromised Assets",
+    })
+    st.dataframe(
+        frame[["Timestamp", "Threat Domain", "Target Sector", "Compromised Assets"]],
+        width="stretch", hide_index=True,
+    )
+
+    # Legally-aligned First-Responder playbook for a selected threat/sector.
+    combos: List[Tuple[str, str]] = sorted({
+        (str(r["threat_domain"]), str(r["target_sector"])) for r in log
+    })
+    labels: List[str] = [f"{domain}  ·  {sector}" for domain, sector in combos]
+    choice: str = st.selectbox("Generate a forensic playbook for:", labels)
+    domain, sector = combos[labels.index(choice)]
+    match: Dict[str, object] = next(
+        (r for r in log if str(r["threat_domain"]) == domain
+         and str(r["target_sector"]) == sector), {})
+    timestamp: str = str(match.get("timestamp", ""))
+    assets: str = str(match.get("compromised_assets", ""))
+    steps: List[Dict[str, str]] = cached_playbook(domain, sector, _cache_day())
+    with st.expander("📋 View First-Responder Investigation Playbook"):
+        for step in steps:
+            st.markdown(f"**{step.get('action', '')}**  \n{step.get('detail', '')}")
+        st.caption("⚖️ Digital-evidence preservation aligned with Section 63(4), "
+                   "Bharatiya Sakshya Adhiniyam (BSA), 2023 (Part A & Part B "
+                   "certificate; SHA-256 hashing; chain of custody).")
+        st.caption(
+            "⚠️ INVESTIGATIVE TRIAGE NOTE: This playbook provides automated "
+            "first-responder guidance and digital forensics preservation "
+            "templates. It does not constitute formal legal advice. Always "
+            "cross-verify final certificate formats and chain-of-custody "
+            "protocols with designated legal counsel or cyber cell prosecutors "
+            "before formal judicial submission."
+        )
+
+    from services.playbook import compile_case_brief
+    brief: str = compile_case_brief(timestamp, domain, sector, assets, steps)
+    safe_name: str = f"{domain}_{sector}".replace(" ", "_").replace("/", "-")
+    st.download_button(
+        "📥 Export Investigation Brief & BSA Certificate Draft",
+        data=brief,
+        file_name=f"cyber_brief_{safe_name}.md",
+        mime="text/markdown",
+    )
+
+
 def render_macro_trends_tab(exclude_demo: bool) -> None:
     """The four analytics modules under one chronological filter."""
     st.caption("Aggregated, AI-synthesized public-domain cybercrime trends. "
@@ -685,6 +791,8 @@ def render_macro_trends_tab(exclude_demo: bool) -> None:
     st.divider()
     st.markdown("### 🚨 Digital & Infrastructure Threat Intel")
     render_infrastructure_kpis(interval, exclude_demo)
+    render_infrastructure_charts(interval, exclude_demo)
+    render_asset_intelligence(interval, exclude_demo)
 
 
 # --------------------------------------------------------------------------- #
