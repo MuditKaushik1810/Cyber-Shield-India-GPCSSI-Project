@@ -333,6 +333,9 @@ def latest_advisories(
             f"WHERE official_safety_advisory IS NOT NULL "
             f"  AND official_safety_advisory != '' "
             f"  AND source_tier != 'demo' "
+            f"  AND source_platform NOT LIKE '%cron%' "
+            f"  AND (source_url IS NULL OR "
+            f"       (source_url NOT LIKE '%.local%' AND source_url NOT LIKE '%cron%')) "
             f"  AND {_DATE_EXPR} >= ? {vector_clause}"
             f"ORDER BY {_DATE_EXPR} DESC LIMIT ?",
             tuple(params),
