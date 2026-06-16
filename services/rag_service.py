@@ -95,6 +95,16 @@ RAG_COLLECTIONS: tuple = (
     "threat_intel_chunks", "expert_feed_chunks", "research_corpus",
 )
 
+# Internal system artifacts that must never surface in the public view
+# (e.g. cron.local test bulletins). Matched against source + url, case-folded.
+INTERNAL_ARTIFACT_MARKERS: tuple = (".local", "cron")
+
+
+def is_internal_artifact(source: str, url: str) -> bool:
+    """True if a chunk's provenance is an internal system artifact."""
+    blob: str = f"{source} {url}".lower()
+    return any(marker in blob for marker in INTERNAL_ARTIFACT_MARKERS)
+
 GUARDRAIL_SYSTEM_PROMPT: str = (
     "You are the intelligence assistant of Cyber Shield India — an expert "
     "Indian digital policing analyst serving investigators and citizens. "
@@ -195,12 +205,25 @@ class RagService:
         distances: List[float] = response["distances"][0]        # type: ignore[index]
         chunks: List[RetrievedChunk] = []
         for text, metadata, distance in zip(documents, metadatas, distances):
+            # research_corpus chunks carry 'source_platform'; older collections
+            # carry 'source'. Fall back across both so chunks never display as
+            # an "unknown" ghost when real provenance exists.
+            source: str = str(
+                metadata.get("source")
+                or metadata.get("source_platform")
+                or "unknown"
+            )
+            category: str = str(
+                metadata.get("threat_category")
+                or metadata.get("scam_vector_type")
+                or ""
+            )
             chunks.append(RetrievedChunk(
                 text=str(text),
-                source=str(metadata.get("source", "unknown")),
+                source=source,
                 url=str(metadata.get("url", "")),
                 date_published=str(metadata.get("date_published", "")),
-                threat_category=str(metadata.get("threat_category", "")),
+                threat_category=category,
                 collection=name,
                 distance=float(distance),
             ))
@@ -223,8 +246,13 @@ class RagService:
         except (ValueError, KeyError):
             LOGGER.exception("Vector retrieval anomaly for query=%r", query[:80])
             return []
+        # Strip internal system artifacts (.local / cron) before ranking so
+        # they can never leak into the public semantic view.
         merged: List[RetrievedChunk] = sorted(
-            (chunk for batch in batches for chunk in batch),
+            (
+                chunk for batch in batches for chunk in batch
+                if not is_internal_artifact(chunk.source, chunk.url)
+            ),
             key=lambda chunk: chunk.distance,
         )[: self.top_k]
         LOGGER.info(
@@ -368,6 +396,63 @@ async def relaxed_search(query: str, k: int = 5) -> List[Dict[str, object]]:
         }
         for chunk in chunks[:k]
     ]
+
+
+SYNTHESIS_PROMPT: str = (
+    "You are the research assistant of Cyber Shield India, an open-access "
+    "cybercrime trend repository. Using ONLY the retrieved context snippets "
+    "below, write a concise, factual answer to the user's question in plain "
+    "English. Ground every claim in the snippets — cite the specific states, "
+    "figures, scam types, or agencies that actually appear. If the snippets "
+    "are only loosely related to the question, say so honestly and summarise "
+    "what IS available instead of inventing facts. Never fabricate numbers, "
+    "states, or sources not present in the context. Keep the answer under "
+    "160 words."
+)
+
+
+async def synthesize_answer(query: str, k: int = 5) -> Dict[str, object]:
+    """Retrieve top-K chunks and synthesize a human-readable grounded answer.
+
+    Unlike generate_response (which enforces the 0.70 official-grounding gate),
+    this always answers from whatever the corpus offers — used by the Semantic
+    Explorer so analytical queries get a real answer, not a raw chunk dump.
+    """
+    service: RagService = get_rag_service()
+    chunks: List[RetrievedChunk] = await service.retrieve(query)
+    if not chunks:
+        return {"answer": None, "citations": [], "matches": []}
+    top: List[RetrievedChunk] = chunks[:k]
+    context: str = service._build_context_window(top)
+    messages: List[object] = [
+        SystemMessage(content=SYNTHESIS_PROMPT),
+        HumanMessage(content=f"CONTEXT SNIPPETS:\n\n{context}\n\nQUESTION: {query}"),
+    ]
+    try:
+        completion = await asyncio.wait_for(
+            service._llm.ainvoke(messages), timeout=INFERENCE_TIMEOUT_SECONDS
+        )
+        answer: str = str(completion.content).strip()
+    except asyncio.TimeoutError:
+        LOGGER.error("synthesis timed out for query=%r", query[:80])
+        answer = ""
+    except GoogleGenerativeAIError:
+        LOGGER.exception("synthesis Gemini fault for query=%r", query[:80])
+        answer = ""
+    except ValueError:
+        LOGGER.exception("synthesis payload fault for query=%r", query[:80])
+        answer = ""
+    return {
+        "answer": answer or None,
+        "citations": [chunk.citation() for chunk in top],
+        "matches": [
+            {"text": c.text, "source": c.source, "url": c.url,
+             "date_published": c.date_published,
+             "threat_category": c.threat_category,
+             "distance": round(c.distance, 4)}
+            for c in top
+        ],
+    }
 
 
 # --------------------------------------------------------------------------- #

@@ -39,6 +39,7 @@ from datetime import datetime, timedelta, timezone
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote_plus, urljoin, urlparse
 
 import aiosqlite
 import httpx
@@ -366,6 +367,51 @@ def _html_to_text(html: str) -> str:
     return " ".join(soup.get_text(" ").split())
 
 
+# Deep-link extraction: hrefs hinting at a specific advisory/article rather
+# than a navigation/listing root.
+ADVISORY_LINK_HINTS: Tuple[str, ...] = (
+    "advisor", "circular", "press", "notification", "bulletin", "alert",
+    "release", "whitepaper", "guideline", "news", "article", "/pdf", ".pdf",
+)
+MAX_LINKS_PER_SOURCE: int = 5
+
+
+def _extract_article_links(html: str, base_url: str) -> List[str]:
+    """Capture exact advisory/article hrefs from a listing page.
+
+    Resolves each anchor to an absolute URL and keeps only deep links (a
+    non-trivial path that is not the base/root), so downstream records carry
+    the specific article URL instead of falling back to the domain root.
+    """
+    soup: BeautifulSoup = BeautifulSoup(html, "html.parser")
+    base_root: str = base_url.rstrip("/")
+    found: List[str] = []
+    for anchor in soup.select("a[href]"):
+        href: str = str(anchor.get("href", "")).strip()
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
+        absolute: str = urljoin(base_url, href)
+        parsed = urlparse(absolute)
+        if parsed.scheme not in ("http", "https"):
+            continue
+        path: str = parsed.path.rstrip("/")
+        if not path:                      # bare domain root — skip
+            continue
+        if absolute.rstrip("/") == base_root:  # same as the listing page
+            continue
+        link_text: str = " ".join(anchor.get_text().split())
+        lowered: str = absolute.lower()
+        looks_like_article: bool = (
+            any(hint in lowered for hint in ADVISORY_LINK_HINTS)
+            or len(link_text) >= 30
+        )
+        if looks_like_article and absolute not in found:
+            found.append(absolute)
+        if len(found) >= MAX_LINKS_PER_SOURCE:
+            break
+    return found
+
+
 # --------------------------------------------------------------------------- #
 # SerpAPI collector (real Google results; replaces Google CSE / DuckDuckGo).   #
 # --------------------------------------------------------------------------- #
@@ -435,7 +481,6 @@ async def _collect_newsapi(
     client: httpx.AsyncClient,
 ) -> List[Tuple[str, str, str]]:
     """Return (platform, url, raw_text) tuples from NewsAPI media desks."""
-    from urllib.parse import quote_plus
     api_key: Optional[str] = get_news_api_key()
     if not api_key:
         LOGGER.info("NewsAPI key absent — skipping media tier")
@@ -536,8 +581,34 @@ class IngestionWorker:
             return _parse_pdf(response.content)
         return _html_to_text(response.text)
 
+    async def _fetch_static_html(
+        self, client: httpx.AsyncClient, browser: Optional[object], url: str
+    ) -> str:
+        """Return the rendered HTML of a listing page (for link extraction)."""
+        if browser is not None:
+            try:
+                page = await browser.new_page(  # type: ignore[attr-defined]
+                    user_agent=random.choice(USER_AGENT_POOL)
+                )
+                await page.goto(url, wait_until="domcontentloaded",
+                                timeout=STATIC_NAV_TIMEOUT_MS)
+                await page.wait_for_timeout(STATIC_SETTLE_MS)
+                html: str = await page.content()
+                await page.close()
+                return html
+            except PlaywrightError:
+                LOGGER.warning("Playwright HTML fetch failed for %s — httpx", url)
+        response: Optional[httpx.Response] = await _fetch(client, url)
+        return response.text if response is not None else ""
+
     async def run_static_tier(self) -> int:
-        """Harvest the deep regulatory set via headless Chromium."""
+        """Harvest the deep regulatory set via headless Chromium.
+
+        For each listing page, capture the exact advisory/article hrefs and
+        ingest each as its own document keyed by the specific deep link, so
+        records never fall back to the domain-root URL. If no deep links are
+        found, the listing page itself is ingested as a last resort.
+        """
         LOGGER.info("STATIC TIER sweep starting (%d sources, playwright=%s)",
                     len(STATIC_SOURCES), _PLAYWRIGHT_AVAILABLE)
         documents: List[Tuple[str, str, str]] = []
@@ -560,9 +631,29 @@ class IngestionWorker:
                 timeout=FETCH_TIMEOUT_SECONDS, follow_redirects=True
             ) as client:
                 for platform, url in STATIC_SOURCES:
-                    text: str = await self._fetch_static_text(client, browser, url)
-                    if len(text) >= 200:
-                        documents.append((platform, url, text))
+                    if url.lower().endswith(".pdf"):
+                        text: str = await self._fetch_static_text(client, browser, url)
+                        if len(text) >= 200:
+                            documents.append((platform, url, text))
+                        continue
+                    html: str = await self._fetch_static_html(client, browser, url)
+                    deep_links: List[str] = (
+                        _extract_article_links(html, url) if html else []
+                    )
+                    if deep_links:
+                        for link in deep_links:
+                            link_text: str = await self._fetch_static_text(
+                                client, browser, link
+                            )
+                            if len(link_text) >= 200:
+                                # Specific advisory href — not the domain root.
+                                documents.append((platform, link, link_text))
+                        LOGGER.info("%s: captured %d deep advisory link(s)",
+                                    platform, len(deep_links))
+                    else:
+                        page_text: str = _html_to_text(html) if html else ""
+                        if len(page_text) >= 200:
+                            documents.append((platform, url, page_text))
         finally:
             if browser is not None:
                 await browser.close()  # type: ignore[attr-defined]
@@ -681,6 +772,47 @@ async def seed_demo() -> int:
 # --------------------------------------------------------------------------- #
 
 
+def purge_vector_ghosts() -> int:
+    """Purge ghost and internal-artifact records from the vector collections.
+
+    Removes the 'unknown - undated' ghost chunks (null/whitespace text or no
+    usable source/source_platform metadata) AND internal system artifacts
+    (``.local`` / ``cron`` provenance) from every research collection.
+    """
+    from core.database import VECTOR_COLLECTION_SPECS, VectorStoreManager
+    from services.rag_service import is_internal_artifact
+    store: VectorStoreManager = VectorStoreManager()
+    removed_total: int = 0
+    for name in VECTOR_COLLECTION_SPECS:
+        collection = store.get_collection(name)
+        payload: Dict[str, object] = collection.get(
+            include=["documents", "metadatas"]
+        )
+        ids: List[str] = list(payload.get("ids", []))            # type: ignore[arg-type]
+        docs: List[Optional[str]] = list(payload.get("documents", []))  # type: ignore[arg-type]
+        metas: List[Optional[Dict[str, object]]] = list(
+            payload.get("metadatas", [])                          # type: ignore[arg-type]
+        )
+        ghosts: List[str] = []
+        for chunk_id, doc, meta in zip(ids, docs, metas):
+            text: str = (doc or "").strip()
+            metadata: Dict[str, object] = meta or {}
+            source: str = str(
+                metadata.get("source")
+                or metadata.get("source_platform") or ""
+            ).strip()
+            url: str = str(metadata.get("url") or "")
+            if len(text) < 20 or not source or is_internal_artifact(source, url):
+                ghosts.append(chunk_id)
+        if ghosts:
+            collection.delete(ids=ghosts)
+            removed_total += len(ghosts)
+            LOGGER.info("Purged %d ghost/artifact chunk(s) from %s",
+                        len(ghosts), name)
+    LOGGER.info("Vector purge complete: %d record(s) removed", removed_total)
+    return removed_total
+
+
 async def run_once() -> None:
     """Run both tiers a single time (used for manual/CI verification)."""
     await init_db()
@@ -728,10 +860,16 @@ def main() -> None:
                         help="run both tiers once and exit")
     parser.add_argument("--seed-demo", action="store_true",
                         help="insert labelled sample rows and exit")
+    parser.add_argument("--purge-ghosts", action="store_true",
+                        help="purge empty/metadata-less vector chunks and exit")
     args: argparse.Namespace = parser.parse_args()
     if args.seed_demo:
         count: int = asyncio.run(seed_demo())
         print(f"Seeded {count} labelled demo rows into fraud_records.")
+        return
+    if args.purge_ghosts:
+        removed: int = purge_vector_ghosts()
+        print(f"Purged {removed} ghost vector record(s).")
         return
     if args.once:
         asyncio.run(run_once())

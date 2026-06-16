@@ -118,6 +118,32 @@ TERMINAL_CSS: str = """
 div[data-baseweb="select"] > div {
     background-color: #FFFFFF !important; color: #1F2937 !important;
 }
+/* Sidebar high-contrast: the navy sidebar background needs light text on all
+   markdown, headings, widget labels, captions, and metrics. Inputs keep dark
+   text on their white fields; Streamlit alert boxes keep their own styling. */
+section[data-testid="stSidebar"] { background-color: #0F2537; }
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] li,
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1,
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h2,
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h3,
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] strong,
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p,
+section[data-testid="stSidebar"] [data-testid="stMetricLabel"],
+section[data-testid="stSidebar"] [data-testid="stMetricLabel"] *,
+section[data-testid="stSidebar"] [data-testid="stMetricValue"] {
+    color: #F1F5F9 !important;
+}
+section[data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] * {
+    color: #B9CFE0 !important;
+}
+section[data-testid="stSidebar"] input,
+section[data-testid="stSidebar"] textarea {
+    color: #1F2937 !important;
+}
 </style>
 """
 
@@ -551,18 +577,24 @@ def _handle_analytical_question(question: str) -> None:
 
 
 def _render_relaxed_fallback(question: str) -> None:
-    """Strip strict filters and surface top conceptual corpus matches."""
-    from services.rag_service import RAG_FALLBACK_MESSAGE, relaxed_search
+    """Synthesize a readable answer from the global corpus, then show sources."""
+    from services.rag_service import RAG_FALLBACK_MESSAGE, synthesize_answer
     try:
-        matches: List[Dict[str, object]] = asyncio.run(relaxed_search(question))
+        result: Dict[str, object] = asyncio.run(synthesize_answer(question))
     except RuntimeError:
-        LOGGER.exception("relaxed semantic fallback failed")
+        LOGGER.exception("relaxed synthesis failed")
         st.warning(f"🛡️ {RAG_FALLBACK_MESSAGE}")
         return
+    matches: List[Dict[str, object]] = result.get("matches", [])  # type: ignore[assignment]
     if not matches:
         st.warning(f"🛡️ {RAG_FALLBACK_MESSAGE}")
         return
     st.info(f"🧭 {STRICT_WINDOW_NOTE}")
+    answer: Optional[str] = result.get("answer")  # type: ignore[assignment]
+    if answer:
+        # Human-readable synthesized answer grounded in the snippets below.
+        st.markdown(str(answer))
+    st.markdown("**Supporting sources**")
     for match in matches:
         source: str = str(match.get("source", "—"))
         dated: str = str(match.get("date_published") or "undated")
