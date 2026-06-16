@@ -44,7 +44,8 @@ def _build_logger() -> logging.Logger:
 
 LOGGER: logging.Logger = _build_logger()
 
-GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
+from core.config import GEMINI_FLASH_MODEL as _FLASH
+GEMINI_MODEL_NAME: str = _FLASH
 
 INTERVAL_PHRASES: Dict[str, str] = {
     "1d": "the past 24 hours", "1w": "the past week",

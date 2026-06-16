@@ -15,7 +15,7 @@ import asyncio
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -49,7 +49,8 @@ def _build_logger() -> logging.Logger:
 
 LOGGER: logging.Logger = _build_logger()
 
-GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
+from core.config import GEMINI_FLASH_MODEL as _FLASH
+GEMINI_MODEL_NAME: str = _FLASH
 EXTRACTION_TIMEOUT_SECONDS: float = 120.0
 # Gemini context is large but we cap input defensively to control cost/latency.
 MAX_INPUT_CHARS: int = 24_000
@@ -65,12 +66,32 @@ class FraudRecordExtraction(BaseModel):
         default=None,
         description="Specific city/district hotspot named, else null.")
     scam_vector_type: str = Field(
-        description="Scam category, e.g. 'Digital Arrest', 'AI Deepfake "
-                    "Identity Theft', 'UPI Payment Fraud', 'Investment Scam', "
-                    "'Loan App Extortion', 'Phishing', 'SIM Swap'.")
+        description="Specific scam/threat label, e.g. 'Digital Arrest', "
+                    "'AI Deepfake Identity Theft', 'UPI Payment Fraud', "
+                    "'Investment Scam', 'Data Breach', 'Phishing', 'SIM Swap', "
+                    "'Ransomware', 'Sextortion'.")
+    threat_domain: Literal[
+        "Financial Fraud", "Data Leak", "Deepfake/Extortion",
+        "Phishing/Spam", "MITM/Infrastructure",
+    ] = Field(
+        default="Financial Fraud",
+        description="The broad threat domain. Map money scams to 'Financial "
+                    "Fraud'; data breaches/leaks to 'Data Leak'; deepfake or "
+                    "blackmail/extortion to 'Deepfake/Extortion'; phishing/spam "
+                    "to 'Phishing/Spam'; MITM/network/infrastructure compromise "
+                    "to 'MITM/Infrastructure'.")
     extracted_case_count: int = Field(
         default=0, ge=0,
         description="Number of cases/victims explicitly cited, else 0.")
+    records_exposed: Optional[int] = Field(
+        default=None, ge=0,
+        description="Records/accounts exposed in a data leak, if stated.")
+    incident_count: Optional[int] = Field(
+        default=None, ge=0,
+        description="Distinct incidents reported (non-financial), if stated.")
+    severity_level: Optional[str] = Field(
+        default=None,
+        description="Severity if stated: Low, Medium, High, or Critical.")
     is_isolated_incident: bool = Field(
         default=False,
         description="True ONLY if the figure describes a single specific "
@@ -127,13 +148,18 @@ class FraudExtractionBatch(BaseModel):
 
 SYSTEM_DIRECTIVE: str = (
     "You are the data-synthesis engine of Cyber Shield India, an open-access "
-    "public research repository on Indian cybercrime trends. You receive one "
-    "raw document (news article, regulatory advisory, or handbook excerpt) "
-    "and must convert ONLY its explicit, factual cyber-fraud content into "
-    "structured datapoints.\n\n"
+    "public research repository covering the FULL Indian cyber-threat ecosystem "
+    "— financial fraud, data leaks, deepfakes/extortion, phishing/spam, and "
+    "MITM/infrastructure compromise. You receive one raw document and must "
+    "convert ONLY its explicit, factual content into structured datapoints.\n\n"
     "STRICT RULES:\n"
+    "0. Set threat_domain to the correct broad domain. For non-financial "
+    "incidents, populate records_exposed / incident_count / severity_level "
+    "when stated and leave the financial fields at 0 — never force a money "
+    "figure onto a data leak or deepfake report.\n"
     "1. Extract only facts present in the text. Never invent states, cities, "
-    "loss figures, case counts, or demographics. Unknown fields stay null/0.\n"
+    "loss figures, case counts, record counts, or demographics. Unknown "
+    "fields stay null/0.\n"
     "2. Convert Indian currency phrasing precisely: 'Rs 5 lakh' -> 500000, "
     "'2.5 crore' -> 25000000.\n"
     "3. TEMPORAL CLASSIFICATION — this is critical. For every monetary figure, "

@@ -17,6 +17,24 @@ ENV_FILE: Final[Path] = PROJECT_ROOT / ".env"
 
 _PLACEHOLDER: Final[str] = "your-google-api-key-here"
 
+# Single source of truth for the Gemini Flash model. gemini-3.5-flash is
+# validated available with its own free-tier daily quota bucket (the prior
+# gemini-2.5-flash hit per-model 429 daily caps). Override with the GEMINI_MODEL
+# environment variable if needed.
+_DEFAULT_GEMINI_MODEL: Final[str] = "gemini-3.5-flash"
+
+# Unified threat-domain taxonomy spanning financial and non-financial cyber
+# threats. Used by the extractor, schema, and dashboard so all domains display
+# together in one continuous flow.
+THREAT_DOMAINS: Final[tuple] = (
+    "Financial Fraud",
+    "Data Leak",
+    "Deepfake/Extortion",
+    "Phishing/Spam",
+    "MITM/Infrastructure",
+)
+DEFAULT_THREAT_DOMAIN: Final[str] = "Financial Fraud"
+
 
 class ConfigurationError(RuntimeError):
     """Raised when a required environment target is missing or invalid."""
@@ -25,6 +43,15 @@ class ConfigurationError(RuntimeError):
 def load_environment() -> None:
     """Load the project ``.env`` file into the process environment."""
     load_dotenv(dotenv_path=ENV_FILE)
+
+
+def get_gemini_model() -> str:
+    """Return the configured Gemini Flash model id (env-overridable)."""
+    load_environment()
+    return os.environ.get("GEMINI_MODEL", "").strip() or _DEFAULT_GEMINI_MODEL
+
+
+GEMINI_FLASH_MODEL: str = get_gemini_model()
 
 
 def get_google_api_key() -> str:

@@ -55,7 +55,8 @@ def _build_logger() -> logging.Logger:
 
 LOGGER: logging.Logger = _build_logger()
 
-GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
+from core.config import GEMINI_FLASH_MODEL as _FLASH
+GEMINI_MODEL_NAME: str = _FLASH
 MAX_ROWS: int = 500
 
 ChartType = Literal["bar", "line", "pie", "scatter", "none"]
@@ -65,10 +66,14 @@ SCHEMA_BRIEF: str = (
     "Table fraud_records(\n"
     "  id INTEGER, source_platform TEXT, source_tier TEXT,\n"
     "  publish_timestamp TEXT, state TEXT, city TEXT, scam_vector_type TEXT,\n"
-    "  extracted_case_count INTEGER, financial_loss_inr REAL,\n"
+    "  threat_domain TEXT, extracted_case_count INTEGER, financial_loss_inr REAL,\n"
+    "  records_exposed INTEGER, incident_count INTEGER, severity_level TEXT,\n"
     "  demographic_age_bracket TEXT, demographic_gender_ratio TEXT,\n"
     "  demographic_profession_target TEXT, official_safety_advisory TEXT,\n"
     "  ingested_at TEXT)\n"
+    "threat_domain is one of 'Financial Fraud','Data Leak','Deepfake/Extortion',"
+    "'Phishing/Spam','MITM/Infrastructure'. records_exposed/incident_count are "
+    "non-financial impact metrics (may be NULL). "
     "Use COALESCE(publish_timestamp, ingested_at) for date filtering. "
     "Money is in INR. Aggregate with SUM/COUNT/AVG and GROUP BY."
 )
