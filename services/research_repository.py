@@ -511,3 +511,84 @@ def corpus_size(database_path: Path = SQLITE_PATH) -> int:
         return 0
     finally:
         connection.close()
+
+
+def briefing_stats(
+    interval: str, exclude_demo: bool = False, database_path: Path = SQLITE_PATH
+) -> Dict[str, object]:
+    """Aggregate stats for the Threat Briefing: totals, leaders, volume shift.
+
+    Compares the current window against the previous equivalent window to
+    surface sudden volume shifts, and identifies the dominant state and scam
+    vector — all from isolated-incident live telemetry (demo-stripped when the
+    pure-operational toggle is on).
+    """
+    cutoff: str = _interval_cutoff(interval)
+    window: timedelta = INTERVAL_WINDOWS.get(interval, INTERVAL_WINDOWS["1y"])
+    prev_start: str = (
+        datetime.now(timezone.utc) - 2 * window
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    demo: str = _demo_clause(exclude_demo)
+    connection: sqlite3.Connection = readonly_connection(database_path)
+    try:
+        current: sqlite3.Row = connection.execute(
+            f"SELECT SUM(extracted_case_count) AS cases, "
+            f"  SUM(financial_loss_inr) AS loss, COUNT(*) AS reports "
+            f"FROM fraud_records "
+            f"WHERE {_ISOLATED_ONLY} {demo}AND {_DATE_EXPR} >= ?",
+            (cutoff,),
+        ).fetchone()
+        previous: sqlite3.Row = connection.execute(
+            f"SELECT SUM(extracted_case_count) AS cases, "
+            f"  SUM(financial_loss_inr) AS loss "
+            f"FROM fraud_records "
+            f"WHERE {_ISOLATED_ONLY} {demo}"
+            f"  AND {_DATE_EXPR} >= ? AND {_DATE_EXPR} < ?",
+            (prev_start, cutoff),
+        ).fetchone()
+        top_state: Optional[sqlite3.Row] = connection.execute(
+            f"SELECT state, SUM(financial_loss_inr) AS loss, "
+            f"  SUM(extracted_case_count) AS cases "
+            f"FROM fraud_records "
+            f"WHERE state IS NOT NULL AND {_ISOLATED_ONLY} {demo}"
+            f"  AND {_DATE_EXPR} >= ? "
+            f"GROUP BY state ORDER BY loss DESC LIMIT 1",
+            (cutoff,),
+        ).fetchone()
+        top_vector: Optional[sqlite3.Row] = connection.execute(
+            f"SELECT scam_vector_type AS vector, "
+            f"  SUM(financial_loss_inr) AS loss "
+            f"FROM fraud_records "
+            f"WHERE scam_vector_type IS NOT NULL AND {_ISOLATED_ONLY} {demo}"
+            f"  AND {_DATE_EXPR} >= ? "
+            f"GROUP BY scam_vector_type ORDER BY loss DESC LIMIT 1",
+            (cutoff,),
+        ).fetchone()
+    except sqlite3.Error:
+        LOGGER.exception("briefing_stats query failed")
+        return {}
+    finally:
+        connection.close()
+
+    cur_cases: int = int(current["cases"] or 0)
+    cur_loss: float = float(current["loss"] or 0.0)
+    prev_cases: int = int(previous["cases"] or 0)
+    prev_loss: float = float(previous["loss"] or 0.0)
+    if prev_cases > 0:
+        volume_delta_pct: float = round((cur_cases - prev_cases) / prev_cases * 100.0, 1)
+    else:
+        volume_delta_pct = 100.0 if cur_cases > 0 else 0.0
+    return {
+        "interval": interval,
+        "total_cases": cur_cases,
+        "total_loss": cur_loss,
+        "reports": int(current["reports"] or 0),
+        "prev_cases": prev_cases,
+        "prev_loss": prev_loss,
+        "volume_delta_pct": volume_delta_pct,
+        "top_state": str(top_state["state"]) if top_state else None,
+        "top_state_loss": float(top_state["loss"] or 0.0) if top_state else 0.0,
+        "top_state_cases": int(top_state["cases"] or 0) if top_state else 0,
+        "top_vector": str(top_vector["vector"]) if top_vector else None,
+        "top_vector_loss": float(top_vector["loss"] or 0.0) if top_vector else 0.0,
+    }

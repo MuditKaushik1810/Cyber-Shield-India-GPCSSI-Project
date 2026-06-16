@@ -410,22 +410,90 @@ SYNTHESIS_PROMPT: str = (
     "160 words."
 )
 
+WEB_AUGMENTED_PROMPT: str = (
+    "You are the research assistant of Cyber Shield India, an open-access "
+    "cybercrime trend repository. You are given two kinds of context: curated "
+    "internal corpus snippets ([CORPUS]) and live web search results ([WEB]). "
+    "Answer the user's question in plain English using ONLY these snippets. "
+    "Prefer [CORPUS] for grounded facts and use [WEB] to add current or broad "
+    "context, clearly attributing web-derived claims. Cite specific states, "
+    "figures, scam types, or agencies that actually appear. Do not fabricate "
+    "anything absent from the context. Keep the answer under 180 words."
+)
 
-async def synthesize_answer(query: str, k: int = 5) -> Dict[str, object]:
-    """Retrieve top-K chunks and synthesize a human-readable grounded answer.
+# Web-augmentation triggers: a query is under-saturated internally when the
+# corpus returns too few chunks or the best match is weak, OR the query asks
+# for real-time / broad context the static corpus cannot satisfy.
+MIN_INTERNAL_CHUNKS: int = 2
+WEB_AUGMENTATION_DISTANCE: float = 0.55
+REALTIME_MARKERS: Tuple[str, ...] = (
+    "latest", "recent", "today", "yesterday", "current", "currently", "now",
+    "this week", "this month", "this year", "2026", "2025", "trend",
+    "trending", "real-time", "real time", "up to date", "news", "breaking",
+)
 
-    Unlike generate_response (which enforces the 0.70 official-grounding gate),
-    this always answers from whatever the corpus offers — used by the Semantic
-    Explorer so analytical queries get a real answer, not a raw chunk dump.
+
+def needs_web_augmentation(
+    query: str, chunks: List[RetrievedChunk]
+) -> bool:
+    """Decide whether a query warrants a live web sweep."""
+    if len(chunks) < MIN_INTERNAL_CHUNKS:
+        return True
+    if chunks and chunks[0].distance > WEB_AUGMENTATION_DISTANCE:
+        return True
+    lowered: str = query.lower()
+    return any(marker in lowered for marker in REALTIME_MARKERS)
+
+
+def _build_combined_context(
+    chunks: List[RetrievedChunk], web_results: List[Dict[str, str]]
+) -> str:
+    """Merge internal corpus chunks and web results into one labelled window."""
+    blocks: List[str] = []
+    for index, chunk in enumerate(chunks, start=1):
+        blocks.append(
+            f"[CORPUS {index} | source: {chunk.source} | "
+            f"date: {chunk.date_published or 'undated'}]\n{chunk.text}"
+        )
+    for index, result in enumerate(web_results, start=1):
+        body: str = " ".join(p for p in (
+            result.get("title", ""), result.get("snippet", "")) if p)
+        blocks.append(
+            f"[WEB {index} | {result.get('link', '')}]\n{body}"
+        )
+    return "\n\n---\n\n".join(blocks)
+
+
+async def synthesize_answer(
+    query: str, k: int = 5, allow_web: bool = True
+) -> Dict[str, object]:
+    """Dual-path synthesis: corpus retrieval + automatic web augmentation.
+
+    Retrieves internal chunks and, when the corpus is under-saturated for the
+    query (too few/weak matches or a real-time/broad ask), triggers a live web
+    sweep, merges both into one context window, and synthesizes a single
+    human-readable answer. Internal safety guardrails (generate_response) are
+    unaffected — this path serves the open research Explorer.
     """
+    from services.web_search import web_search
+
     service: RagService = get_rag_service()
     chunks: List[RetrievedChunk] = await service.retrieve(query)
-    if not chunks:
-        return {"answer": None, "citations": [], "matches": []}
     top: List[RetrievedChunk] = chunks[:k]
-    context: str = service._build_context_window(top)
+
+    web_results: List[Dict[str, str]] = []
+    if allow_web and needs_web_augmentation(query, top):
+        web_results = await asyncio.to_thread(web_search, query)
+
+    if not top and not web_results:
+        return {"answer": None, "citations": [], "matches": [],
+                "web_sources": [], "web_augmented": False}
+
+    web_augmented: bool = bool(web_results)
+    context: str = _build_combined_context(top, web_results)
+    prompt: str = WEB_AUGMENTED_PROMPT if web_augmented else SYNTHESIS_PROMPT
     messages: List[object] = [
-        SystemMessage(content=SYNTHESIS_PROMPT),
+        SystemMessage(content=prompt),
         HumanMessage(content=f"CONTEXT SNIPPETS:\n\n{context}\n\nQUESTION: {query}"),
     ]
     try:
@@ -442,6 +510,8 @@ async def synthesize_answer(query: str, k: int = 5) -> Dict[str, object]:
     except ValueError:
         LOGGER.exception("synthesis payload fault for query=%r", query[:80])
         answer = ""
+    LOGGER.info("synthesis complete: web_augmented=%s corpus=%d web=%d query=%r",
+                web_augmented, len(top), len(web_results), query[:80])
     return {
         "answer": answer or None,
         "citations": [chunk.citation() for chunk in top],
@@ -452,6 +522,8 @@ async def synthesize_answer(query: str, k: int = 5) -> Dict[str, object]:
              "distance": round(c.distance, 4)}
             for c in top
         ],
+        "web_sources": web_results,
+        "web_augmented": web_augmented,
     }
 
 
