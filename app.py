@@ -107,6 +107,12 @@ TERMINAL_CSS: str = """
     border: 1px dashed #CBD5E1; border-radius: 6px; padding: 18px 20px;
     background: #FFFFFF; color: #475569; text-align: center;
 }
+.cs-briefing {
+    border: 1px solid #C7DCEC; border-left: 6px solid #0A74B9;
+    border-radius: 8px; padding: 14px 20px; margin: 6px 0 4px 0;
+    background: #F0F7FC; color: #1F2937; font-size: 0.92rem; line-height: 1.5;
+}
+.cs-briefing b { color: #0A74B9; letter-spacing: 0.08em; }
 /* Contrast patch: navy theme darkens inputs; force readable field text. */
 .stTextInput input, .stTextArea textarea {
     background-color: #FFFFFF !important; color: #1F2937 !important;
@@ -118,30 +124,48 @@ TERMINAL_CSS: str = """
 div[data-baseweb="select"] > div {
     background-color: #FFFFFF !important; color: #1F2937 !important;
 }
-/* Sidebar high-contrast: the navy sidebar background needs light text on all
-   markdown, headings, widget labels, captions, and metrics. Inputs keep dark
-   text on their white fields; Streamlit alert boxes keep their own styling. */
-section[data-testid="stSidebar"] { background-color: #0F2537; }
-section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
-section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
-section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] li,
-section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1,
-section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h2,
-section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h3,
-section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] strong,
+/* === Sidebar high-contrast: navy background, light text everywhere ===
+   Broad element + legacy/emotion-class selectors force legibility regardless
+   of Streamlit's exact DOM or system light/dark mode. Light-background
+   controls (inputs, dropdowns, file uploader, alerts, default buttons) are
+   re-darkened afterwards so their own text stays readable. */
+section[data-testid="stSidebar"],
+section[data-testid="stSidebar"] > div,
+div[data-testid="stSidebarContent"] {
+    background-color: #0F2537 !important;
+}
+section[data-testid="stSidebar"] h1,
+section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3,
+section[data-testid="stSidebar"] h4,
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] span,
+section[data-testid="stSidebar"] li,
 section[data-testid="stSidebar"] label,
-section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p,
-section[data-testid="stSidebar"] [data-testid="stMetricLabel"],
+section[data-testid="stSidebar"] small,
+section[data-testid="stSidebar"] strong,
+section[data-testid="stSidebar"] .stMarkdown,
+section[data-testid="stSidebar"] .stMarkdown *,
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] *,
+section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] *,
 section[data-testid="stSidebar"] [data-testid="stMetricLabel"] *,
-section[data-testid="stSidebar"] [data-testid="stMetricValue"] {
+section[data-testid="stSidebar"] [data-testid="stMetricValue"],
+section[data-testid="stSidebar"] [class*="css-"],
+section[data-testid="stSidebar"] [class*="st-emotion-cache-"] {
     color: #F1F5F9 !important;
 }
 section[data-testid="stSidebar"] [data-testid="stCaptionContainer"],
 section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] * {
     color: #B9CFE0 !important;
 }
+/* Keep text dark on the light-background interactive controls. */
 section[data-testid="stSidebar"] input,
-section[data-testid="stSidebar"] textarea {
+section[data-testid="stSidebar"] textarea,
+section[data-testid="stSidebar"] div[data-baseweb="select"] *,
+section[data-testid="stSidebar"] div[data-baseweb="popover"] *,
+section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] *,
+section[data-testid="stSidebar"] [data-testid="stAlert"] *,
+section[data-testid="stSidebar"] button p {
     color: #1F2937 !important;
 }
 </style>
@@ -194,6 +218,14 @@ def cached_demographic(
 ) -> List[Dict[str, object]]:
     """Interval-filtered demographic breakdown rows (cache-keyed on all inputs)."""
     return rr.demographic_matrix(interval, dimension, exclude_demo)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_briefing(interval: str, exclude_demo: bool, day: str) -> str:
+    """Story-driven Threat Briefing for the active filter (cached 5 min)."""
+    from services.briefing import generate_briefing
+    stats: Dict[str, object] = rr.briefing_stats(interval, exclude_demo)
+    return generate_briefing(stats, interval)
 
 
 def _inr(value: float) -> str:
@@ -500,6 +532,12 @@ def render_macro_trends_tab(exclude_demo: bool) -> None:
         format_func=lambda key: INTERVAL_LABELS[key],
         horizontal=True, index=3,
     )
+    briefing: str = cached_briefing(interval, exclude_demo, _cache_day())
+    st.markdown(
+        f"""<div class="cs-briefing">📰 <b>THREAT BRIEFING</b>
+        &nbsp;·&nbsp; {INTERVAL_LABELS.get(interval, interval)}<br>{briefing}</div>""",
+        unsafe_allow_html=True,
+    )
     st.divider()
     render_geospatial(interval, exclude_demo)
     st.divider()
@@ -586,15 +624,32 @@ def _render_relaxed_fallback(question: str) -> None:
         st.warning(f"🛡️ {RAG_FALLBACK_MESSAGE}")
         return
     matches: List[Dict[str, object]] = result.get("matches", [])  # type: ignore[assignment]
-    if not matches:
+    web_sources: List[Dict[str, object]] = result.get("web_sources", [])  # type: ignore[assignment]
+    if not matches and not web_sources:
         st.warning(f"🛡️ {RAG_FALLBACK_MESSAGE}")
         return
-    st.info(f"🧭 {STRICT_WINDOW_NOTE}")
+    if bool(result.get("web_augmented")):
+        st.info("🌐 **Web-augmented** — the corpus was sparse for this query, so "
+                "live web results were merged into the answer.")
+    else:
+        st.info(f"🧭 {STRICT_WINDOW_NOTE}")
     answer: Optional[str] = result.get("answer")  # type: ignore[assignment]
     if answer:
         # Human-readable synthesized answer grounded in the snippets below.
         st.markdown(str(answer))
-    st.markdown("**Supporting sources**")
+    if web_sources:
+        st.markdown("**🌐 Live web sources**")
+        for web in web_sources:
+            title: str = str(web.get("title") or "Web result")
+            link: str = str(web.get("link") or "")
+            snippet: str = str(web.get("snippet") or "")
+            with st.expander(f"🌐 {title}"):
+                st.markdown(snippet)
+                if link:
+                    st.markdown(f"🔗 Source Link: [{link}]({link})")
+    if not matches:
+        return
+    st.markdown("**Supporting corpus sources**")
     for match in matches:
         source: str = str(match.get("source", "—"))
         dated: str = str(match.get("date_published") or "undated")
