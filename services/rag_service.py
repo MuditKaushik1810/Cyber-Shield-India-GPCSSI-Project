@@ -360,6 +360,7 @@ async def relaxed_search(query: str, k: int = 5) -> List[Dict[str, object]]:
         {
             "text": chunk.text,
             "source": chunk.source,
+            "url": chunk.url,
             "date_published": chunk.date_published,
             "threat_category": chunk.threat_category,
             "collection": chunk.collection,

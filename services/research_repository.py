@@ -240,11 +240,17 @@ _DATE_EXPR: str = "COALESCE(publish_timestamp, ingested_at)"
 _ISOLATED_ONLY: str = "is_isolated_incident = 1"
 
 
+def _demo_clause(exclude_demo: bool) -> str:
+    """SQL fragment stripping demo-tier rows when pure-operational mode is on."""
+    return "AND source_tier != 'demo' " if exclude_demo else ""
+
+
 def geospatial_hotspots(
-    interval: str, database_path: Path = SQLITE_PATH
+    interval: str, exclude_demo: bool = False, database_path: Path = SQLITE_PATH
 ) -> List[Dict[str, object]]:
     """State/city scam density and financial impact within the interval."""
     cutoff: str = _interval_cutoff(interval)
+    demo: str = _demo_clause(exclude_demo)
     connection: sqlite3.Connection = readonly_connection(database_path)
     try:
         rows: List[sqlite3.Row] = connection.execute(
@@ -253,7 +259,8 @@ def geospatial_hotspots(
             f"  SUM(financial_loss_inr)   AS loss, "
             f"  COUNT(*)                  AS reports "
             f"FROM fraud_records "
-            f"WHERE state IS NOT NULL AND {_ISOLATED_ONLY} AND {_DATE_EXPR} >= ? "
+            f"WHERE state IS NOT NULL AND {_ISOLATED_ONLY} {demo}"
+            f"  AND {_DATE_EXPR} >= ? "
             f"GROUP BY state, city "
             f"ORDER BY loss DESC",
             (cutoff,),
@@ -267,7 +274,8 @@ def geospatial_hotspots(
 
 
 def demographic_matrix(
-    interval: str, dimension: str, database_path: Path = SQLITE_PATH
+    interval: str, dimension: str, exclude_demo: bool = False,
+    database_path: Path = SQLITE_PATH,
 ) -> List[Dict[str, object]]:
     """Targeted-demographic breakdown for one dimension within the interval.
 
@@ -280,6 +288,7 @@ def demographic_matrix(
     }
     column: str = column_map.get(dimension, "demographic_age_bracket")
     cutoff: str = _interval_cutoff(interval)
+    demo: str = _demo_clause(exclude_demo)
     connection: sqlite3.Connection = readonly_connection(database_path)
     try:
         rows: List[sqlite3.Row] = connection.execute(
@@ -288,7 +297,7 @@ def demographic_matrix(
             f"  SUM(financial_loss_inr)   AS loss "
             f"FROM fraud_records "
             f"WHERE {column} IS NOT NULL AND {column} != '' "
-            f"  AND {_ISOLATED_ONLY} AND {_DATE_EXPR} >= ? "
+            f"  AND {_ISOLATED_ONLY} {demo}AND {_DATE_EXPR} >= ? "
             f"GROUP BY {column} "
             f"ORDER BY cases DESC",
             (cutoff,),
@@ -315,12 +324,15 @@ def latest_advisories(
         params.append(scam_vector)
     params.append(limit)
     try:
+        # Exclude demo-tier rows: advisory cards must reflect only genuine
+        # crawled telemetry, never the 'demo_sample' bring-up seed.
         rows: List[sqlite3.Row] = connection.execute(
             f"SELECT scam_vector_type, state, official_safety_advisory, "
-            f"  {_DATE_EXPR} AS dated, source_platform "
+            f"  {_DATE_EXPR} AS dated, source_platform, source_url "
             f"FROM fraud_records "
             f"WHERE official_safety_advisory IS NOT NULL "
             f"  AND official_safety_advisory != '' "
+            f"  AND source_tier != 'demo' "
             f"  AND {_DATE_EXPR} >= ? {vector_clause}"
             f"ORDER BY {_DATE_EXPR} DESC LIMIT ?",
             tuple(params),
@@ -347,7 +359,8 @@ DEFICIT_WINDOW_DAYS: int = 30
 
 
 def state_versus_national(
-    interval: str, state: str, database_path: Path = SQLITE_PATH
+    interval: str, state: str, exclude_demo: bool = False,
+    database_path: Path = SQLITE_PATH,
 ) -> Dict[str, object]:
     """Raw live state telemetry alongside an explicit NCRB control benchmark.
 
@@ -359,6 +372,7 @@ def state_versus_national(
     """
     cutoff: str = _interval_cutoff(interval)
     fraction: float = _window_fraction(interval)
+    demo: str = _demo_clause(exclude_demo)
     deficit_cutoff: str = (
         datetime.now(timezone.utc) - timedelta(days=DEFICIT_WINDOW_DAYS)
     ).strftime("%Y-%m-%d %H:%M:%S")
@@ -369,13 +383,13 @@ def state_versus_national(
             f"  SUM(financial_loss_inr)   AS loss, "
             f"  COUNT(*)                  AS reports "
             f"FROM fraud_records "
-            f"WHERE state = ? AND {_ISOLATED_ONLY} AND {_DATE_EXPR} >= ?",
+            f"WHERE state = ? AND {_ISOLATED_ONLY} {demo}AND {_DATE_EXPR} >= ?",
             (state, cutoff),
         ).fetchone()
         deficit_row: sqlite3.Row = connection.execute(
             f"SELECT SUM(extracted_case_count) AS cases "
             f"FROM fraud_records "
-            f"WHERE state = ? AND {_ISOLATED_ONLY} AND {_DATE_EXPR} >= ?",
+            f"WHERE state = ? AND {_ISOLATED_ONLY} {demo}AND {_DATE_EXPR} >= ?",
             (state, deficit_cutoff),
         ).fetchone()
         baseline: Optional[sqlite3.Row] = connection.execute(
@@ -431,10 +445,11 @@ def state_versus_national(
 
 
 def scam_vector_landscape(
-    interval: str, database_path: Path = SQLITE_PATH
+    interval: str, exclude_demo: bool = False, database_path: Path = SQLITE_PATH
 ) -> List[Dict[str, object]]:
     """Scam-vector distribution (cases + financial toll) within the interval."""
     cutoff: str = _interval_cutoff(interval)
+    demo: str = _demo_clause(exclude_demo)
     connection: sqlite3.Connection = readonly_connection(database_path)
     try:
         rows: List[sqlite3.Row] = connection.execute(
@@ -444,7 +459,7 @@ def scam_vector_landscape(
             f"  COUNT(*)                  AS reports "
             f"FROM fraud_records "
             f"WHERE scam_vector_type IS NOT NULL AND scam_vector_type != '' "
-            f"  AND {_ISOLATED_ONLY} AND {_DATE_EXPR} >= ? "
+            f"  AND {_ISOLATED_ONLY} {demo}AND {_DATE_EXPR} >= ? "
             f"GROUP BY scam_vector_type "
             f"ORDER BY loss DESC",
             (cutoff,),

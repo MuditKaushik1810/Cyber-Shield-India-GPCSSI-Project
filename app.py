@@ -21,6 +21,7 @@ Run:  streamlit run app.py     (worker: python ingestion_worker.py)
 import asyncio
 import io
 import logging
+from datetime import datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -136,22 +137,37 @@ def get_agent() -> Optional[ResearchAgent]:
         return None
 
 
+def _cache_day() -> str:
+    """Today's UTC date — folded into cache keys for date-relative freshness."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+# Each cache is keyed on (interval, exclude_demo, day): toggling the
+# chronological filter OR the data-integrity toggle instantly invalidates the
+# entry, forcing a fresh windowed SQLite read; a date rollover invalidates via
+# ``day``.
 @st.cache_data(ttl=60, show_spinner=False)
-def cached_hotspots(interval: str) -> List[Dict[str, object]]:
-    """Interval-filtered geospatial hot-spot rows (cached)."""
-    return rr.geospatial_hotspots(interval)
+def cached_hotspots(
+    interval: str, exclude_demo: bool, day: str
+) -> List[Dict[str, object]]:
+    """Interval-filtered geospatial hot-spot rows (cache-keyed on all inputs)."""
+    return rr.geospatial_hotspots(interval, exclude_demo)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def cached_vectors(interval: str) -> List[Dict[str, object]]:
-    """Interval-filtered scam-vector landscape rows (cached)."""
-    return rr.scam_vector_landscape(interval)
+def cached_vectors(
+    interval: str, exclude_demo: bool, day: str
+) -> List[Dict[str, object]]:
+    """Interval-filtered scam-vector landscape rows (cache-keyed on all inputs)."""
+    return rr.scam_vector_landscape(interval, exclude_demo)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def cached_demographic(interval: str, dimension: str) -> List[Dict[str, object]]:
-    """Interval-filtered demographic breakdown rows (cached)."""
-    return rr.demographic_matrix(interval, dimension)
+def cached_demographic(
+    interval: str, dimension: str, exclude_demo: bool, day: str
+) -> List[Dict[str, object]]:
+    """Interval-filtered demographic breakdown rows (cache-keyed on all inputs)."""
+    return rr.demographic_matrix(interval, dimension, exclude_demo)
 
 
 def _inr(value: float) -> str:
@@ -195,16 +211,27 @@ def render_empty_state(message: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def render_geospatial(interval: str) -> None:
-    """India hot-spot map (cities) + state-level financial-impact bars."""
+def render_geospatial(interval: str, exclude_demo: bool) -> None:
+    """India hot-spot map (cities) + state-level financial-impact bars.
+
+    Every layer is rebuilt from the interval-filtered frame on each rerun:
+    bubble size binds to live ``cases`` and colour intensity to live
+    ``loss``. A state/window with no live telemetry renders a clean
+    zero-state instead of a stale placeholder layer.
+    """
     st.markdown("#### 🗺️ Geospatial Crime Hot-Spots")
-    rows: List[Dict[str, object]] = cached_hotspots(interval)
-    if not rows:
-        render_empty_state("No regional datapoints in this window yet.")
-        return
+    rows: List[Dict[str, object]] = cached_hotspots(
+        interval, exclude_demo, _cache_day())
     frame: pd.DataFrame = pd.DataFrame(rows)
-    frame["loss"] = frame["loss"].fillna(0.0)
-    frame["cases"] = frame["cases"].fillna(0).astype(int)
+    # Drop rows that carry no live signal so zero-telemetry states never
+    # surface as artifacts on the map or bars.
+    if not frame.empty:
+        frame["loss"] = frame["loss"].fillna(0.0)
+        frame["cases"] = frame["cases"].fillna(0).astype(int)
+        frame = frame[(frame["cases"] > 0) | (frame["loss"] > 0)]
+    if frame.empty:
+        st.info("No active telemetry records captured for this filter window.")
+        return
 
     map_col, bar_col = st.columns([3, 2])
     with map_col:
@@ -212,13 +239,15 @@ def render_geospatial(interval: str) -> None:
         if not mapped.empty:
             mapped["lat"] = mapped["city"].map(lambda c: CITY_COORDS[c][0])
             mapped["lon"] = mapped["city"].map(lambda c: CITY_COORDS[c][1])
+            max_loss: float = float(mapped["loss"].max()) or 1.0
             figure: go.Figure = px.scatter_geo(
                 mapped, lat="lat", lon="lon", size="cases",
                 color="loss", hover_name="city",
                 hover_data={"state": True, "loss": ":,.0f", "cases": True,
                             "lat": False, "lon": False},
-                color_continuous_scale="Reds", size_max=42,
-                title="Hot-spot cities — bubble size = cases, colour = ₹ loss",
+                color_continuous_scale="Reds", range_color=[0, max_loss],
+                size_max=42,
+                title="Hot-spot cities — bubble size = live cases, colour = ₹ loss",
             )
             figure.update_geos(scope="asia", center={"lat": 22.0, "lon": 80.0},
                                lataxis_range=[6, 37], lonaxis_range=[67, 98],
@@ -226,7 +255,7 @@ def render_geospatial(interval: str) -> None:
             figure.update_layout(height=360, margin={"l": 0, "r": 0, "t": 40, "b": 0})
             st.plotly_chart(figure, use_container_width=True)
         else:
-            render_empty_state("No mapped cities in this window.")
+            st.info("No mapped hot-spot cities with live telemetry this window.")
     with bar_col:
         by_state: pd.DataFrame = (
             frame.groupby("state", as_index=False)["loss"].sum()
@@ -234,7 +263,7 @@ def render_geospatial(interval: str) -> None:
         )
         bar: go.Figure = px.bar(
             by_state, x="loss", y="state", orientation="h",
-            title="Financial impact by state (₹)",
+            title="Financial impact by state (₹, live)",
             color_discrete_sequence=["#0A74B9"],
         )
         bar.update_layout(height=360, margin={"l": 0, "r": 0, "t": 40, "b": 0})
@@ -246,10 +275,11 @@ def render_geospatial(interval: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def render_vector_landscape(interval: str) -> None:
+def render_vector_landscape(interval: str, exclude_demo: bool) -> None:
     """Distribution of emerging scam types by cases and financial toll."""
     st.markdown("#### 🧬 Scam-Vector Landscape")
-    rows: List[Dict[str, object]] = cached_vectors(interval)
+    rows: List[Dict[str, object]] = cached_vectors(
+        interval, exclude_demo, _cache_day())
     if not rows:
         render_empty_state("No scam-vector datapoints in this window yet.")
         return
@@ -277,7 +307,7 @@ def render_vector_landscape(interval: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def render_demographic(interval: str) -> None:
+def render_demographic(interval: str, exclude_demo: bool) -> None:
     """Side-by-side age/gender/profession charts + live advisory panel."""
     st.markdown("#### 👥 Demographic Vulnerability Matrix")
     charts_col, advisory_col = st.columns([3, 2])
@@ -288,7 +318,8 @@ def render_demographic(interval: str) -> None:
         ]
         triple: List[object] = st.columns(3)
         for column, (dimension, label) in zip(triple, dims):
-            data: List[Dict[str, object]] = cached_demographic(interval, dimension)
+            data: List[Dict[str, object]] = cached_demographic(
+                interval, dimension, exclude_demo, _cache_day())
             with column:  # type: ignore[union-attr]
                 if not data:
                     render_empty_state(f"No {label.lower()} data.")
@@ -303,7 +334,8 @@ def render_demographic(interval: str) -> None:
                 st.plotly_chart(fig, use_container_width=True)
     with advisory_col:
         st.markdown("**Matching official safety advisories**")
-        vectors: List[Dict[str, object]] = cached_vectors(interval)
+        vectors: List[Dict[str, object]] = cached_vectors(
+            interval, exclude_demo, _cache_day())
         vector_names: List[str] = [str(v["vector"]) for v in vectors]
         chosen: Optional[str] = None
         if vector_names:
@@ -314,15 +346,19 @@ def render_demographic(interval: str) -> None:
             interval, scam_vector=chosen, limit=6
         )
         if not advisories:
-            render_empty_state("No advisories matched this filter.")
+            st.info("No active telemetry records captured for this filter window.")
         for advisory in advisories:
+            url: str = str(advisory.get("source_url") or "")
+            link_html: str = (
+                f'<br>🔗 <a href="{url}" target="_blank">Source</a>' if url else ""
+            )
             st.markdown(
                 f"""<div class="cs-advisory">🛡️ <b>{advisory['scam_vector_type']}</b>
                 &nbsp;·&nbsp; {advisory.get('state') or 'National'}<br>
                 {advisory.get('official_safety_advisory') or ''}
                 <br><span style="color:#6B7280;font-size:0.72rem;">
                 {advisory.get('source_platform') or ''} ·
-                {advisory.get('dated') or ''}</span></div>""",
+                {advisory.get('dated') or ''}</span>{link_html}</div>""",
                 unsafe_allow_html=True,
             )
 
@@ -332,8 +368,12 @@ def render_demographic(interval: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def render_state_tracker(interval: str) -> None:
-    """Raw live state telemetry overlaid against the NCRB control benchmark."""
+def render_state_tracker(interval: str, exclude_demo: bool) -> None:
+    """Raw live state telemetry overlaid against the NCRB control benchmark.
+
+    In pure-operational mode (``exclude_demo``), the NCRB baseline overlay is
+    suppressed entirely — the tracker shows only live crawled telemetry.
+    """
     st.markdown("#### 📍 Localized State Tracker")
     states: List[str] = rr.distinct_states()
     if not states:
@@ -341,7 +381,8 @@ def render_state_tracker(interval: str) -> None:
         return
     default_index: int = states.index("Tamil Nadu") if "Tamil Nadu" in states else 0
     state: str = st.selectbox("Select your state context", states, index=default_index)
-    snapshot: Dict[str, object] = rr.state_versus_national(interval, state)
+    snapshot: Dict[str, object] = rr.state_versus_national(
+        interval, state, exclude_demo)
     if not snapshot:
         render_empty_state("No comparison available for this state/window.")
         return
@@ -351,12 +392,33 @@ def render_state_tracker(interval: str) -> None:
     bench_loss: float = float(snapshot["benchmark_loss"])     # type: ignore[arg-type]
     window_label: str = INTERVAL_LABELS.get(interval, interval)
 
-    # Engineering ingestion-deficit alert (Step 3).
-    if bool(snapshot.get("ingestion_deficit")):
+    # Engineering ingestion-deficit alert (shown only when the NCRB control is
+    # in play; pure-operational mode has no baseline to compare against).
+    if not exclude_demo and bool(snapshot.get("ingestion_deficit")):
         st.warning(
             "⚠️ Potential Ingestion Deficit: High-baseline region yielding zero "
             "telemetry. Verify crawler connectivity for this state's domains."
         )
+
+    if exclude_demo:
+        # Pure operational view — live telemetry only, no NCRB baseline.
+        st.caption("🟢 Pure operational mode — NCRB baseline overlay hidden.")
+        metric_cols: List[object] = st.columns(2)
+        with metric_cols[0]:
+            st.metric(f"Live cases · {window_label}", f"{live_cases:,.0f}")
+        with metric_cols[1]:
+            st.metric(f"Live loss · {window_label}", _inr(live_loss))
+        figure: go.Figure = go.Figure()
+        figure.add_bar(x=["Reported cases"], y=[live_cases], name="Live captured",
+                       marker={"color": "#0A74B9"})
+        figure.update_layout(
+            title=f"{state}: live telemetry ({window_label})",
+            height=320, margin={"l": 10, "r": 10, "t": 40, "b": 10},
+            showlegend=False,
+        )
+        st.plotly_chart(figure, use_container_width=True)
+        return
+
     st.caption(f"Dominant historical vector: **{snapshot.get('primary_vector', '—')}** "
                f"· NCRB annual baseline: {int(snapshot.get('annual_cases', 0)):,} cases")
 
@@ -378,7 +440,7 @@ def render_state_tracker(interval: str) -> None:
             st.metric(f"Expected loss · {window_label}", _inr(bench_loss))
 
     # Live solid bar with the NCRB baseline as a dashed reference line.
-    figure: go.Figure = go.Figure()
+    figure = go.Figure()
     figure.add_bar(x=["Reported cases"], y=[live_cases], name="Live captured",
                    marker={"color": "#0A74B9"})
     figure.add_hline(
@@ -400,23 +462,26 @@ def render_state_tracker(interval: str) -> None:
                    "NCRB baseline for this window.")
 
 
-def render_macro_trends_tab() -> None:
+def render_macro_trends_tab(exclude_demo: bool) -> None:
     """The four analytics modules under one chronological filter."""
     st.caption("Aggregated, AI-synthesized public-domain cybercrime trends. "
                "Use the chronological filter to scope every module below.")
+    if exclude_demo:
+        st.caption("🔒 **Pure operational mode** — demo & NCRB-baseline records "
+                   "stripped; charts reflect live crawled telemetry only.")
     interval: str = st.radio(
         "Chronological filter", INTERVAL_ORDER,
         format_func=lambda key: INTERVAL_LABELS[key],
         horizontal=True, index=3,
     )
     st.divider()
-    render_geospatial(interval)
+    render_geospatial(interval, exclude_demo)
     st.divider()
-    render_vector_landscape(interval)
+    render_vector_landscape(interval, exclude_demo)
     st.divider()
-    render_demographic(interval)
+    render_demographic(interval, exclude_demo)
     st.divider()
-    render_state_tracker(interval)
+    render_state_tracker(interval, exclude_demo)
 
 
 # --------------------------------------------------------------------------- #
@@ -499,14 +564,16 @@ def _render_relaxed_fallback(question: str) -> None:
         return
     st.info(f"🧭 {STRICT_WINDOW_NOTE}")
     for match in matches:
-        st.markdown(
-            f"""<div class="cs-citation">📌 <b>{match.get('source', '—')}</b>
-            &nbsp;·&nbsp; {match.get('date_published') or 'undated'}
-            &nbsp;·&nbsp; {match.get('threat_category') or 'general'}
-            &nbsp;·&nbsp; similarity {1.0 - float(match.get('distance', 1.0)):.2f}
-            <br>{str(match.get('text', ''))[:320]}…</div>""",
-            unsafe_allow_html=True,
-        )
+        source: str = str(match.get("source", "—"))
+        dated: str = str(match.get("date_published") or "undated")
+        similarity: float = 1.0 - float(match.get("distance", 1.0))
+        with st.expander(f"📌 {source} — {dated} — similarity {similarity:.2f}"):
+            st.markdown(str(match.get("text", "")))   # full, untruncated body
+            url: str = str(match.get("url") or "")
+            if url:
+                st.markdown(f"🔗 Source Link: [{url}]({url})")
+            else:
+                st.caption("🔗 Source link unavailable for this record.")
 
 
 def _render_semantic_answer(question: str) -> None:
@@ -521,11 +588,18 @@ def _render_semantic_answer(question: str) -> None:
     if bool(envelope.get("grounded")):
         st.markdown(str(envelope.get("answer", "")))
         citations: List[Dict[str, object]] = envelope.get("citations", [])  # type: ignore[assignment]
+        st.markdown("**Cited sources**")
         for citation in citations:
+            url: str = str(citation.get("url") or "")
+            link_html: str = (
+                f'&nbsp;·&nbsp; 🔗 <a href="{url}" target="_blank">Source</a>'
+                if url else ""
+            )
             st.markdown(
                 f"""<div class="cs-citation">📌 <b>{citation.get('source', '—')}</b>
                 &nbsp;·&nbsp; {citation.get('date_published') or 'undated'}
-                &nbsp;·&nbsp; {citation.get('threat_category') or 'general'}</div>""",
+                &nbsp;·&nbsp; {citation.get('threat_category') or 'general'}
+                {link_html}</div>""",
                 unsafe_allow_html=True,
             )
     else:
@@ -682,6 +756,17 @@ def main() -> None:
     render_header()
     corpus: int = rr.corpus_size()
     st.sidebar.metric("Curated datapoints", f"{corpus:,}")
+
+    # Global data-integrity toggle: strip demo & NCRB-baseline records to view
+    # pure operational (live-crawled) telemetry across every chart and map.
+    st.sidebar.markdown("### 🧭 Data Integrity")
+    exclude_demo: bool = st.sidebar.toggle(
+        "Pure operational data only",
+        value=False,
+        help="Strip demo sample rows and the NCRB historical baseline overlay "
+             "so charts and maps reflect only live-crawled telemetry.",
+    )
+
     if corpus == 0:
         st.info("The research corpus is empty. Run the ingestion worker "
                 "(`python ingestion_worker.py --seed-demo` for sample data, "
@@ -691,10 +776,11 @@ def main() -> None:
         "📊 Macro Trends", "🔎 Semantic Knowledge Explorer",
     ])
     with trends_tab:
-        render_macro_trends_tab()
+        render_macro_trends_tab(exclude_demo)
     with explorer_tab:
         render_explorer_tab()
-    LOGGER.info("Frame rendered (corpus=%d)", corpus)
+    LOGGER.info("Frame rendered (corpus=%d, pure_operational=%s)",
+                corpus, exclude_demo)
 
 
 if __name__ == "__main__":
