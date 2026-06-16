@@ -279,6 +279,8 @@ SCHEMA_DDL: Tuple[str, ...] = (
         -- existing financial summaries).
         records_exposed               INTEGER,
         incident_count                INTEGER,
+        compromised_assets            TEXT,
+        target_sector                 TEXT,
         severity_level                TEXT,
         -- Temporal classification (Phase 2): isolated case vs macro summary.
         is_isolated_incident          INTEGER NOT NULL DEFAULT 1,
@@ -468,6 +470,9 @@ _FRAUD_MIGRATION_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("records_exposed", "INTEGER"),
     ("incident_count", "INTEGER"),
     ("severity_level", "TEXT"),
+    # Phase 2: generalizable web-seeded impact descriptors.
+    ("compromised_assets", "TEXT"),
+    ("target_sector", "TEXT"),
 )
 
 

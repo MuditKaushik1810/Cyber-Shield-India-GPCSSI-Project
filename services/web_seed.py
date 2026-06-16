@@ -11,7 +11,7 @@ caller falls back to a clean, un-broken zero state.
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -53,6 +53,89 @@ GEMINI_MODEL_NAME: str = _FLASH
 def web_seed_available() -> bool:
     """True when the live web-seeding pipeline can run (SerpAPI configured)."""
     return web_search_available()
+
+
+# --------------------------------------------------------------------------- #
+# 0. Relational threat parsing (web snippet -> structured fraud_records row).  #
+# --------------------------------------------------------------------------- #
+
+
+class WebThreatRecord(BaseModel):
+    """One web result parsed into the unified threat taxonomy."""
+
+    threat_domain: Literal[
+        "Financial Fraud", "Data & Privacy Breaches",
+        "Social & Behavioral Exploitation", "Deceptive & Malicious Campaigns",
+        "Network & Infrastructure Attacks", "Emerging & Other Cybercrimes",
+    ] = Field(default="Emerging & Other Cybercrimes",
+              description="The broad threat domain for this result.")
+    scam_vector_type: str = Field(
+        default="Cyber Incident",
+        description="Specific threat label, e.g. 'Ransomware', 'Data Breach'.")
+    state: Optional[str] = Field(
+        default=None, description="Indian state/UT if named, else null.")
+    target_sector: Optional[str] = Field(
+        default=None,
+        description="Targeted sector: Critical Infrastructure, Healthcare, "
+                    "Banking, Public Sector, Individuals, etc.")
+    compromised_assets: Optional[str] = Field(
+        default=None,
+        description="Assets compromised, e.g. '12 IP addresses', 'Corporate PII'.")
+    records_exposed: Optional[int] = Field(
+        default=None, ge=0, description="Records exposed if stated.")
+    incident_count: Optional[int] = Field(
+        default=None, ge=0, description="Incidents reported if stated, else 1.")
+    severity_level: Optional[str] = Field(
+        default=None, description="Low / Medium / High / Critical, if stated.")
+
+
+class WebThreatBatch(BaseModel):
+    """One parsed record per input web result, in order."""
+
+    records: List[WebThreatRecord] = Field(default_factory=list)
+
+
+_THREAT_PARSE_PROMPT: str = (
+    "You classify cybercrime web search results into a structured threat "
+    "taxonomy for India. Return EXACTLY ONE record per numbered result, in the "
+    "SAME ORDER. For each, set threat_domain, a specific scam_vector_type, and "
+    "any stated target_sector, compromised_assets, records_exposed, "
+    "incident_count, severity_level, and Indian state. Use ONLY facts present "
+    "in the result — never invent figures. If a result is not about an Indian "
+    "cyber incident, still classify it under 'Emerging & Other Cybercrimes'."
+)
+
+
+def parse_web_threats(
+    web_results: List[Dict[str, str]]
+) -> List[WebThreatRecord]:
+    """Gemini-parse web results into structured threat records (best effort).
+
+    Returns one record per result in order; empty list on any LLM fault so the
+    caller skips relational seeding gracefully.
+    """
+    if not web_results:
+        return []
+    numbered: str = "\n".join(
+        f"{i + 1}. TITLE: {r.get('title', '')} | SNIPPET: {r.get('snippet', '')}"
+        for i, r in enumerate(web_results)
+    )
+    try:
+        llm = ChatGoogleGenerativeAI(
+            model=GEMINI_MODEL_NAME, temperature=0.0,
+            google_api_key=get_google_api_key(),
+        ).with_structured_output(WebThreatBatch)
+        batch: Optional[WebThreatBatch] = llm.invoke([
+            SystemMessage(content=_THREAT_PARSE_PROMPT),
+            HumanMessage(content=f"SEARCH RESULTS:\n{numbered}"),
+        ])
+    except (GoogleGenerativeAIError, ValidationError, ValueError):
+        LOGGER.exception("web threat parse failed — skipping relational seed")
+        return []
+    if batch is None:
+        return []
+    LOGGER.info("parse_web_threats: %d record(s)", len(batch.records))
+    return batch.records
 
 
 # --------------------------------------------------------------------------- #

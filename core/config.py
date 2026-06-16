@@ -28,12 +28,15 @@ _DEFAULT_GEMINI_MODEL: Final[str] = "gemini-3.5-flash"
 # together in one continuous flow.
 THREAT_DOMAINS: Final[tuple] = (
     "Financial Fraud",
-    "Data Leak",
-    "Deepfake/Extortion",
-    "Phishing/Spam",
-    "MITM/Infrastructure",
+    "Data & Privacy Breaches",
+    "Social & Behavioral Exploitation",
+    "Deceptive & Malicious Campaigns",
+    "Network & Infrastructure Attacks",
+    "Emerging & Other Cybercrimes",
 )
 DEFAULT_THREAT_DOMAIN: Final[str] = "Financial Fraud"
+# Non-financial domains drive the lower 'Digital & Infrastructure' section.
+NON_FINANCIAL_DOMAINS: Final[tuple] = THREAT_DOMAINS[1:]
 
 
 class ConfigurationError(RuntimeError):

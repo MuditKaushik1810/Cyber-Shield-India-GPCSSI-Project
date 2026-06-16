@@ -149,24 +149,28 @@ class ResearchRepository:
                     records_exposed = getattr(record, "records_exposed", None)
                     incident_count = getattr(record, "incident_count", None)
                     severity_level = getattr(record, "severity_level", None)
+                    compromised_assets = getattr(record, "compromised_assets", None)
+                    target_sector = getattr(record, "target_sector", None)
                     cursor: aiosqlite.Cursor = await connection.execute(
                         "INSERT OR IGNORE INTO fraud_records ("
                         " source_platform, source_tier, publish_timestamp, "
                         " state, city, scam_vector_type, threat_domain, "
                         " extracted_case_count, financial_loss_inr, "
-                        " records_exposed, incident_count, severity_level, "
+                        " records_exposed, incident_count, compromised_assets, "
+                        " target_sector, severity_level, "
                         " is_isolated_incident, incident_loss_inr, "
                         " is_macro_historical_summary, macro_summary_loss_inr, "
                         " demographic_age_bracket, demographic_gender_ratio, "
                         " demographic_profession_target, official_safety_advisory, "
                         " source_url, content_hash) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             meta.source_platform, meta.source_tier,
                             record.publish_timestamp, record.state, record.city,
                             record.scam_vector_type, threat_domain,
                             record.extracted_case_count, financial_loss,
-                            records_exposed, incident_count, severity_level,
+                            records_exposed, incident_count, compromised_assets,
+                            target_sector, severity_level,
                             isolated, record.incident_loss_inr,
                             macro, record.macro_summary_loss_inr,
                             record.demographic_age_bracket,
@@ -254,6 +258,11 @@ _ISOLATED_ONLY: str = "is_isolated_incident = 1"
 def _demo_clause(exclude_demo: bool) -> str:
     """SQL fragment stripping demo-tier rows when pure-operational mode is on."""
     return "AND source_tier != 'demo' " if exclude_demo else ""
+
+
+# Restricts the technical (Digital & Infrastructure) aggregations to the
+# non-financial threat domains so they never touch the financial dashboard.
+_NON_FINANCIAL: str = "AND threat_domain != 'Financial Fraud' "
 
 
 def geospatial_hotspots(
@@ -524,20 +533,18 @@ def domain_kpis(
     connection: sqlite3.Connection = readonly_connection(database_path)
     try:
         totals: sqlite3.Row = connection.execute(
-            f"SELECT SUM(financial_loss_inr) AS loss, "
-            f"  SUM(records_exposed) AS records, "
+            f"SELECT SUM(records_exposed) AS records, "
             f"  SUM(incident_count) AS incidents, "
             f"  COUNT(DISTINCT threat_domain) AS domains "
             f"FROM fraud_records "
-            f"WHERE {_ISOLATED_ONLY} {demo}AND {_DATE_EXPR} >= ?",
+            f"WHERE {_ISOLATED_ONLY} {demo}{_NON_FINANCIAL}AND {_DATE_EXPR} >= ?",
             (cutoff,),
         ).fetchone()
         rows: List[sqlite3.Row] = connection.execute(
             f"SELECT threat_domain AS domain, COUNT(*) AS n, "
-            f"  SUM(financial_loss_inr) AS loss, "
             f"  SUM(records_exposed) AS records "
             f"FROM fraud_records "
-            f"WHERE {_ISOLATED_ONLY} {demo}AND {_DATE_EXPR} >= ? "
+            f"WHERE {_ISOLATED_ONLY} {demo}{_NON_FINANCIAL}AND {_DATE_EXPR} >= ? "
             f"GROUP BY threat_domain ORDER BY n DESC",
             (cutoff,),
         ).fetchall()
@@ -547,12 +554,175 @@ def domain_kpis(
     finally:
         connection.close()
     return {
-        "financial_loss": float(totals["loss"] or 0.0),
         "records_exposed": int(totals["records"] or 0),
         "incidents": int(totals["incidents"] or 0),
         "active_domains": int(totals["domains"] or 0),
         "by_domain": [dict(row) for row in rows],
     }
+
+
+def records_by_sector(
+    interval: str, exclude_demo: bool = False, database_path: Path = SQLITE_PATH
+) -> List[Dict[str, object]]:
+    """Total records exposed grouped by targeted sector (non-financial)."""
+    cutoff: str = _interval_cutoff(interval)
+    demo: str = _demo_clause(exclude_demo)
+    connection: sqlite3.Connection = readonly_connection(database_path)
+    try:
+        rows: List[sqlite3.Row] = connection.execute(
+            f"SELECT COALESCE(target_sector, 'Unspecified') AS sector, "
+            f"  SUM(records_exposed) AS records, COUNT(*) AS incidents "
+            f"FROM fraud_records "
+            f"WHERE {_ISOLATED_ONLY} {demo}{_NON_FINANCIAL}"
+            f"  AND records_exposed IS NOT NULL AND {_DATE_EXPR} >= ? "
+            f"GROUP BY COALESCE(target_sector, 'Unspecified') "
+            f"ORDER BY records DESC",
+            (cutoff,),
+        ).fetchall()
+    except sqlite3.Error:
+        LOGGER.exception("records_by_sector query failed")
+        return []
+    finally:
+        connection.close()
+    return [dict(row) for row in rows]
+
+
+def incidents_by_domain(
+    interval: str, exclude_demo: bool = False, database_path: Path = SQLITE_PATH
+) -> List[Dict[str, object]]:
+    """Incident volume across the non-financial threat domains."""
+    cutoff: str = _interval_cutoff(interval)
+    demo: str = _demo_clause(exclude_demo)
+    connection: sqlite3.Connection = readonly_connection(database_path)
+    try:
+        rows: List[sqlite3.Row] = connection.execute(
+            f"SELECT threat_domain AS domain, "
+            f"  SUM(COALESCE(incident_count, 1)) AS incidents "
+            f"FROM fraud_records "
+            f"WHERE {_ISOLATED_ONLY} {demo}{_NON_FINANCIAL}AND {_DATE_EXPR} >= ? "
+            f"GROUP BY threat_domain ORDER BY incidents DESC",
+            (cutoff,),
+        ).fetchall()
+    except sqlite3.Error:
+        LOGGER.exception("incidents_by_domain query failed")
+        return []
+    finally:
+        connection.close()
+    return [dict(row) for row in rows]
+
+
+def asset_log(
+    interval: str, exclude_demo: bool = False, limit: int = 15,
+    database_path: Path = SQLITE_PATH,
+) -> List[Dict[str, object]]:
+    """Recent non-financial technical indicators for the Asset Intelligence Log.
+
+    Surfaces timestamp, threat domain, target sector, and the compromised
+    assets (malicious IPs / phishing URLs / leaked datasets) seeded via the
+    web pipeline.
+    """
+    cutoff: str = _interval_cutoff(interval)
+    demo: str = _demo_clause(exclude_demo)
+    connection: sqlite3.Connection = readonly_connection(database_path)
+    try:
+        rows: List[sqlite3.Row] = connection.execute(
+            f"SELECT ingested_at AS timestamp, threat_domain, "
+            f"  COALESCE(target_sector, 'Unspecified') AS target_sector, "
+            f"  COALESCE(compromised_assets, scam_vector_type, '—') "
+            f"    AS compromised_assets, "
+            f"  source_url "
+            f"FROM fraud_records "
+            f"WHERE {_ISOLATED_ONLY} {demo}{_NON_FINANCIAL}AND {_DATE_EXPR} >= ? "
+            f"ORDER BY ingested_at DESC LIMIT ?",
+            (cutoff, limit),
+        ).fetchall()
+    except sqlite3.Error:
+        LOGGER.exception("asset_log query failed")
+        return []
+    finally:
+        connection.close()
+    return [dict(row) for row in rows]
+
+
+def existing_web_hashes(
+    hashes: List[str], database_path: Path = SQLITE_PATH
+) -> set:
+    """Return the subset of content hashes already present (pre-parse dedup)."""
+    if not hashes:
+        return set()
+    placeholders: str = ",".join("?" for _ in hashes)
+    connection: sqlite3.Connection = readonly_connection(database_path)
+    try:
+        rows: List[sqlite3.Row] = connection.execute(
+            f"SELECT content_hash FROM fraud_records "
+            f"WHERE content_hash IN ({placeholders})",
+            tuple(hashes),
+        ).fetchall()
+    except sqlite3.Error:
+        LOGGER.exception("existing_web_hashes query failed")
+        return set()
+    finally:
+        connection.close()
+    return {str(row["content_hash"]) for row in rows}
+
+
+def web_row_hash(url: str, title: str) -> str:
+    """Stable dedup hash for a web-seeded relational row (URL, else title)."""
+    basis: str = (url or title).strip().lower()
+    return "webseed-" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:32]
+
+
+def insert_web_threat_rows(
+    rows: List[Dict[str, object]], database_path: Path = SQLITE_PATH
+) -> int:
+    """Active INSERT of web-parsed non-financial threats into fraud_records.
+
+    Financial fields are zeroed so these rows NEVER affect the financial
+    dashboard; they populate the technical (records/incidents/sector) charts.
+    Deduplicated by URL/title content hash via INSERT OR IGNORE.
+    """
+    if not rows:
+        return 0
+    written: int = 0
+    connection: sqlite3.Connection = sqlite3.connect(database_path)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        for row in rows:
+            url: str = str(row.get("url") or "")
+            title: str = str(row.get("title") or "")
+            digest: str = web_row_hash(url, title)
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO fraud_records ("
+                " source_platform, source_tier, publish_timestamp, state, "
+                " scam_vector_type, threat_domain, extracted_case_count, "
+                " financial_loss_inr, records_exposed, incident_count, "
+                " compromised_assets, target_sector, severity_level, "
+                " is_isolated_incident, incident_loss_inr, source_url, "
+                " content_hash) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "Web-Seeded: Explorer", "dynamic",
+                    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                    row.get("state"), str(row.get("scam_vector_type") or "Cyber Incident"),
+                    str(row.get("threat_domain") or "Emerging & Other Cybercrimes"),
+                    0, 0.0,
+                    row.get("records_exposed"),
+                    int(row.get("incident_count") or 1),
+                    row.get("compromised_assets"), row.get("target_sector"),
+                    row.get("severity_level"), 1, 0.0, url or None, digest,
+                ),
+            )
+            if cursor.rowcount and cursor.rowcount > 0:
+                written += 1
+        connection.commit()
+    except sqlite3.Error:
+        connection.rollback()
+        LOGGER.exception("insert_web_threat_rows failed — rolled back")
+        return 0
+    finally:
+        connection.close()
+    LOGGER.info("insert_web_threat_rows: %d non-financial row(s) written", written)
+    return written
 
 
 def corpus_size(database_path: Path = SQLITE_PATH) -> int:

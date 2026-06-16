@@ -71,15 +71,20 @@ class FraudRecordExtraction(BaseModel):
                     "'Investment Scam', 'Data Breach', 'Phishing', 'SIM Swap', "
                     "'Ransomware', 'Sextortion'.")
     threat_domain: Literal[
-        "Financial Fraud", "Data Leak", "Deepfake/Extortion",
-        "Phishing/Spam", "MITM/Infrastructure",
+        "Financial Fraud", "Data & Privacy Breaches",
+        "Social & Behavioral Exploitation", "Deceptive & Malicious Campaigns",
+        "Network & Infrastructure Attacks", "Emerging & Other Cybercrimes",
     ] = Field(
         default="Financial Fraud",
-        description="The broad threat domain. Map money scams to 'Financial "
-                    "Fraud'; data breaches/leaks to 'Data Leak'; deepfake or "
-                    "blackmail/extortion to 'Deepfake/Extortion'; phishing/spam "
-                    "to 'Phishing/Spam'; MITM/network/infrastructure compromise "
-                    "to 'MITM/Infrastructure'.")
+        description="The broad threat domain. Money/UPI/loan/investment scams -> "
+                    "'Financial Fraud'; data breaches/leaks/PII exposure -> "
+                    "'Data & Privacy Breaches'; phishing/romance/sextortion/"
+                    "impersonation/social engineering -> 'Social & Behavioral "
+                    "Exploitation'; malware/ransomware/deepfake/fake-app "
+                    "campaigns -> 'Deceptive & Malicious Campaigns'; "
+                    "MITM/DDoS/router/DNS/server/infrastructure compromise -> "
+                    "'Network & Infrastructure Attacks'; anything else -> "
+                    "'Emerging & Other Cybercrimes'.")
     extracted_case_count: int = Field(
         default=0, ge=0,
         description="Number of cases/victims explicitly cited, else 0.")
@@ -89,6 +94,14 @@ class FraudRecordExtraction(BaseModel):
     incident_count: Optional[int] = Field(
         default=None, ge=0,
         description="Distinct incidents reported (non-financial), if stated.")
+    compromised_assets: Optional[str] = Field(
+        default=None,
+        description="Free-text assets compromised, e.g. '12 IP addresses', "
+                    "'3 phishing domains', 'Corporate PII', if stated.")
+    target_sector: Optional[str] = Field(
+        default=None,
+        description="Targeted sector, e.g. 'Critical Infrastructure', "
+                    "'Healthcare', 'Banking', 'Public Sector', 'Individuals'.")
     severity_level: Optional[str] = Field(
         default=None,
         description="Severity if stated: Low, Medium, High, or Critical.")
