@@ -253,7 +253,7 @@ def render_geospatial(interval: str, exclude_demo: bool) -> None:
                                lataxis_range=[6, 37], lonaxis_range=[67, 98],
                                showcountries=True, landcolor="#EAEFF4")
             figure.update_layout(height=360, margin={"l": 0, "r": 0, "t": 40, "b": 0})
-            st.plotly_chart(figure, use_container_width=True)
+            st.plotly_chart(figure, width="stretch")
         else:
             st.info("No mapped hot-spot cities with live telemetry this window.")
     with bar_col:
@@ -267,7 +267,7 @@ def render_geospatial(interval: str, exclude_demo: bool) -> None:
             color_discrete_sequence=["#0A74B9"],
         )
         bar.update_layout(height=360, margin={"l": 0, "r": 0, "t": 40, "b": 0})
-        st.plotly_chart(bar, use_container_width=True)
+        st.plotly_chart(bar, width="stretch")
 
 
 # --------------------------------------------------------------------------- #
@@ -291,7 +291,7 @@ def render_vector_landscape(interval: str, exclude_demo: bool) -> None:
             title="Share of reported cases by scam type",
         )
         pie.update_layout(height=340, margin={"l": 0, "r": 0, "t": 40, "b": 0})
-        st.plotly_chart(pie, use_container_width=True)
+        st.plotly_chart(pie, width="stretch")
     with right:
         bar: go.Figure = px.bar(
             frame.sort_values("loss"), x="loss", y="vector", orientation="h",
@@ -299,7 +299,7 @@ def render_vector_landscape(interval: str, exclude_demo: bool) -> None:
             color_discrete_sequence=["#0F2537"],
         )
         bar.update_layout(height=340, margin={"l": 0, "r": 0, "t": 40, "b": 0})
-        st.plotly_chart(bar, use_container_width=True)
+        st.plotly_chart(bar, width="stretch")
 
 
 # --------------------------------------------------------------------------- #
@@ -331,7 +331,7 @@ def render_demographic(interval: str, exclude_demo: bool) -> None:
                 )
                 fig.update_layout(height=300, xaxis_title=None, yaxis_title=None,
                                   margin={"l": 0, "r": 0, "t": 40, "b": 0})
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
     with advisory_col:
         st.markdown("**Matching official safety advisories**")
         vectors: List[Dict[str, object]] = cached_vectors(
@@ -416,7 +416,7 @@ def render_state_tracker(interval: str, exclude_demo: bool) -> None:
             height=320, margin={"l": 10, "r": 10, "t": 40, "b": 10},
             showlegend=False,
         )
-        st.plotly_chart(figure, use_container_width=True)
+        st.plotly_chart(figure, width="stretch")
         return
 
     st.caption(f"Dominant historical vector: **{snapshot.get('primary_vector', '—')}** "
@@ -453,7 +453,7 @@ def render_state_tracker(interval: str, exclude_demo: bool) -> None:
         height=320, yaxis_range=[0, headroom],
         margin={"l": 10, "r": 10, "t": 40, "b": 10}, showlegend=False,
     )
-    st.plotly_chart(figure, use_container_width=True)
+    st.plotly_chart(figure, width="stretch")
     if live_cases < bench_cases:
         st.caption("📉 Live captures are running **below** the historical NCRB "
                    "baseline for this window.")
@@ -542,10 +542,10 @@ def _handle_analytical_question(question: str) -> None:
         frame: pd.DataFrame = pd.DataFrame(rows)
         figure: Optional[go.Figure] = _build_chart(plan, frame)
         if figure is not None:
-            st.plotly_chart(figure, use_container_width=True)
+            st.plotly_chart(figure, width="stretch")
         with st.expander("Underlying data & query"):
             st.code(plan.sql, language="sql")
-            st.dataframe(frame, use_container_width=True)
+            st.dataframe(frame, width="stretch")
         return
     _render_semantic_answer(question)
 
