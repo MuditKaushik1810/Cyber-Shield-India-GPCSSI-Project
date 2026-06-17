@@ -100,8 +100,8 @@ def generate_briefing(stats: Dict[str, object], interval: str) -> str:
     """Produce a 3-sentence threat briefing (Gemini, deterministic fallback)."""
     if not stats or (int(stats.get("total_cases", 0)) == 0      # type: ignore[arg-type]
                      and float(stats.get("total_loss", 0.0)) == 0.0):  # type: ignore[arg-type]
-        return ("No live-captured telemetry is available for this filter "
-                "window yet — run the ingestion worker to populate the brief.")
+        return ("No telemetry is available for this filter window yet. Widen "
+                "the chronological range or explore another threat domain.")
     fallback: str = _template_briefing(stats, interval)
     try:
         llm = ChatGoogleGenerativeAI(

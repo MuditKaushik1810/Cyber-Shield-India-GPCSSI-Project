@@ -178,6 +178,29 @@ section[data-testid="stSidebar"] [data-testid="stAlert"] *,
 section[data-testid="stSidebar"] button p {
     color: #1F2937 !important;
 }
+/* === Sidebar file-uploader: high-contrast, visible without hover ===
+   The dropzone + Browse button must read clearly on the navy sidebar. */
+section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] {
+    background-color: #14304A !important;
+    border: 1.5px dashed #FFFFFF !important;
+    border-radius: 8px !important;
+}
+section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"],
+section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] *,
+section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzoneInstructions"] * {
+    color: #FFFFFF !important;
+}
+section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button,
+section[data-testid="stSidebar"] [data-testid="stFileUploader"] button {
+    background-color: #0A74B9 !important;
+    color: #FFFFFF !important;
+    border: 1.5px solid #FFFFFF !important;
+    font-weight: 700 !important;
+    opacity: 1 !important;
+}
+section[data-testid="stSidebar"] [data-testid="stFileUploader"] button:hover {
+    background-color: #0C8AE0 !important;
+}
 </style>
 """
 
@@ -260,6 +283,81 @@ def cached_playbook(
     """Cached 4-point forensic triage playbook (one LLM call per combo/day)."""
     from services.playbook import generate_triage_playbook
     return generate_triage_playbook(threat_domain, target_sector)
+
+
+# --- Cached read-side wrappers: every dashboard query is cache-keyed so a    --
+# --- filter rerun never re-opens the SQLite file on the main thread. The     --
+# --- minute-bucket key keeps RAG-seeded / worker-written rows fresh.         --
+def _minute_bucket() -> str:
+    """Cache key that rolls every 30s so newly-written rows surface quickly."""
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y%m%d%H") + str(now.minute // 1)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_advisories(interval: str, scam_vector: Optional[str], bucket: str
+                      ) -> List[Dict[str, object]]:
+    """Cached official-safety advisories for the active filter."""
+    return rr.latest_advisories(interval, scam_vector=scam_vector, limit=6)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_states(bucket: str) -> List[str]:
+    """Cached state/UT list for the tracker selector."""
+    return rr.distinct_states()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_state_snapshot(interval: str, state: str, exclude_demo: bool,
+                          bucket: str) -> Dict[str, object]:
+    """Cached live-vs-benchmark snapshot for one state."""
+    return rr.state_versus_national(interval, state, exclude_demo)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_domain_kpis(interval: str, exclude_demo: bool, bucket: str
+                       ) -> Dict[str, object]:
+    """Cached non-financial KPI aggregate (30s so seeded rows surface fast)."""
+    return rr.domain_kpis(interval, exclude_demo)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_records_by_sector(interval: str, exclude_demo: bool, bucket: str
+                             ) -> List[Dict[str, object]]:
+    """Cached records-exposed-by-sector aggregate."""
+    return rr.records_by_sector(interval, exclude_demo)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_incidents_by_domain(interval: str, exclude_demo: bool, bucket: str
+                               ) -> List[Dict[str, object]]:
+    """Cached incidents-by-domain aggregate."""
+    return rr.incidents_by_domain(interval, exclude_demo)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_asset_log(interval: str, exclude_demo: bool, bucket: str
+                     ) -> List[Dict[str, object]]:
+    """Cached non-financial asset intelligence log."""
+    return rr.asset_log(interval, exclude_demo)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_corpus_size(bucket: str) -> int:
+    """Cached corpus row count."""
+    return rr.corpus_size()
+
+
+@st.cache_resource(show_spinner=False)
+def warm_resources() -> bool:
+    """Load heavy ML resources (embedding model) once per session — keeps the
+    embedding model out of the per-rerun hot path and off stdout."""
+    try:
+        from core.database import VectorStoreManager
+        VectorStoreManager().get_collection("research_corpus")
+    except (RuntimeError, ValueError, KeyError):
+        LOGGER.exception("resource warmup skipped")
+    return True
 
 
 ZERO_STATE_MESSAGE: str = "No active telemetry records captured for this filter window."
@@ -495,9 +593,7 @@ def render_demographic(interval: str, exclude_demo: bool) -> None:
             chosen = st.selectbox("Filter advisories by scam type",
                                   ["All"] + vector_names)
             chosen = None if chosen == "All" else chosen
-        advisories: List[Dict[str, object]] = rr.latest_advisories(
-            interval, scam_vector=chosen, limit=6
-        )
+        advisories: List[Dict[str, object]] = cached_advisories(interval, chosen, _minute_bucket())
         if not advisories:
             # Zero-state: seed live advisory cards from the web for this vector.
             seed_topic: str = chosen or "cyber fraud"
@@ -531,14 +627,14 @@ def render_state_tracker(interval: str, exclude_demo: bool) -> None:
     suppressed entirely — the tracker shows only live crawled telemetry.
     """
     st.markdown("#### 📍 Localized State Tracker")
-    states: List[str] = rr.distinct_states()
+    states: List[str] = cached_states(_minute_bucket())
     if not states:
         render_empty_state("No state-level data in the corpus yet.")
         return
     default_index: int = states.index("Tamil Nadu") if "Tamil Nadu" in states else 0
     state: str = st.selectbox("Select your state context", states, index=default_index)
-    snapshot: Dict[str, object] = rr.state_versus_national(
-        interval, state, exclude_demo)
+    snapshot: Dict[str, object] = cached_state_snapshot(
+        interval, state, exclude_demo, _minute_bucket())
     if not snapshot:
         render_empty_state("No comparison available for this state/window.")
         return
@@ -636,7 +732,7 @@ def render_infrastructure_kpis(interval: str, exclude_demo: bool) -> None:
     Strictly separate from the financial dashboard above — currency never
     appears here; the financial loss stays in the financial section.
     """
-    kpis: Dict[str, object] = rr.domain_kpis(interval, exclude_demo)
+    kpis: Dict[str, object] = cached_domain_kpis(interval, exclude_demo, _minute_bucket())
     if not kpis:
         st.info(ZERO_STATE_MESSAGE)
         return
@@ -657,8 +753,8 @@ def render_infrastructure_kpis(interval: str, exclude_demo: bool) -> None:
         st.markdown(f"<div style='margin:2px 0 6px 0;'>{chips}</div>",
                     unsafe_allow_html=True)
     st.caption("Non-financial threat-domain telemetry (data leaks, deepfakes, "
-               "phishing, MITM) populates as the ingestion worker harvests "
-               "these sources.")
+               "phishing, network attacks) updates continuously as new "
+               "intelligence is captured.")
 
 
 _GATHERING_MSG: str = (
@@ -669,8 +765,10 @@ _GATHERING_MSG: str = (
 
 def render_infrastructure_charts(interval: str, exclude_demo: bool) -> None:
     """Two-column non-financial analytics: records-by-sector + domain matrix."""
-    sectors: List[Dict[str, object]] = rr.records_by_sector(interval, exclude_demo)
-    domains: List[Dict[str, object]] = rr.incidents_by_domain(interval, exclude_demo)
+    sectors: List[Dict[str, object]] = cached_records_by_sector(
+        interval, exclude_demo, _minute_bucket())
+    domains: List[Dict[str, object]] = cached_incidents_by_domain(
+        interval, exclude_demo, _minute_bucket())
     if not sectors and not domains:
         st.info(_GATHERING_MSG)
         return
@@ -706,7 +804,7 @@ def render_infrastructure_charts(interval: str, exclude_demo: bool) -> None:
 def render_asset_intelligence(interval: str, exclude_demo: bool) -> None:
     """Asset Intelligence Log + legally-aligned forensic triage playbook."""
     st.markdown("#### 🔍 Actionable Technical Indicators & Assets")
-    log: List[Dict[str, object]] = rr.asset_log(interval, exclude_demo)
+    log: List[Dict[str, object]] = cached_asset_log(interval, exclude_demo, _minute_bucket())
     if not log:
         st.info(_GATHERING_MSG)
         return
@@ -770,7 +868,8 @@ def render_macro_trends_tab(exclude_demo: bool) -> None:
         format_func=lambda key: INTERVAL_LABELS[key],
         horizontal=True, index=3,
     )
-    briefing: str = cached_briefing(interval, exclude_demo, _cache_day())
+    with st.spinner("Compiling live threat intelligence…"):
+        briefing: str = cached_briefing(interval, exclude_demo, _cache_day())
     st.markdown(
         f"""<div class="cs-briefing">📰 <b>THREAT BRIEFING</b>
         &nbsp;·&nbsp; {INTERVAL_LABELS.get(interval, interval)}<br>{briefing}</div>""",
@@ -1088,8 +1187,10 @@ def main() -> None:
         page_icon="🛡️", layout="wide",
     )
     st.markdown(TERMINAL_CSS, unsafe_allow_html=True)
+    with st.spinner("Initializing intelligence engine…"):
+        warm_resources()
     render_header()
-    corpus: int = rr.corpus_size()
+    corpus: int = cached_corpus_size(_minute_bucket())
     st.sidebar.metric("Curated datapoints", f"{corpus:,}")
 
     # Global data-integrity toggle: strip demo & NCRB-baseline records to view
@@ -1103,9 +1204,9 @@ def main() -> None:
     )
 
     if corpus == 0:
-        st.info("The research corpus is empty. Run the ingestion worker "
-                "(`python ingestion_worker.py --seed-demo` for sample data, "
-                "or `python ingestion_worker.py` for live harvesting).")
+        st.info("📡 Threat intelligence is being gathered. Use the Semantic "
+                "Knowledge Explorer to query live cyber-threat data while the "
+                "repository populates.")
     render_sandbox_sidebar()
     trends_tab, explorer_tab = st.tabs([
         "📊 Macro Trends", "🔎 Semantic Knowledge Explorer",
