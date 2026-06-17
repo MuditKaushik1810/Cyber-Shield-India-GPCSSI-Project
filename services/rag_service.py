@@ -93,6 +93,51 @@ from core.config import GEMINI_FLASH_MODEL as _FLASH
 GEMINI_MODEL_NAME: str = _FLASH
 INFERENCE_TIMEOUT_SECONDS: float = 90.0
 
+# Multi-model rotation: the Gemini free-tier daily cap is PER MODEL, so when one
+# model exhausts its pool the synthesis cascades to the next endpoint.
+MODEL_CASCADE_ORDER: List[str] = [
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
+
+# User-facing markdown shown when EVERY model in the cascade is quota-exhausted.
+QUOTA_EXHAUSTED_MESSAGE: str = (
+    "⚠️ **Daily research capacity reached.** All available community AI models "
+    "have hit their free-tier query limit for today. Your search retrieved the "
+    "sources below, but the AI summary is paused — please try again shortly, as "
+    "capacity resets daily."
+)
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    """True if the error is a 429 / RESOURCE_EXHAUSTED quota exhaustion."""
+    message: str = str(exc)
+    return ("429" in message or "RESOURCE_EXHAUSTED" in message
+            or "exceeded your current quota" in message.lower())
+
+
+def _content_to_text(content: object) -> str:
+    """Normalize an LLM completion's content into clean text.
+
+    Newer Gemini models return content as a list of typed blocks
+    (``[{'type': 'text', 'text': '...'}]``); older ones return a plain string.
+    This flattens both into readable text so the UI never shows raw blocks.
+    """
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(str(block.get("text", "")))
+            else:
+                parts.append(str(block))
+        return " ".join(part for part in parts if part).strip()
+    return str(content).strip()
+
 RAG_COLLECTIONS: tuple = (
     "threat_intel_chunks", "expert_feed_chunks", "research_corpus",
 )
@@ -177,15 +222,72 @@ class RagService:
         self.top_k: int = top_k
         self.max_grounding_distance: float = max_grounding_distance
         self._vector_store: VectorStoreManager = VectorStoreManager()
-        self._llm: ChatGoogleGenerativeAI = ChatGoogleGenerativeAI(
-            model=GEMINI_MODEL_NAME,
-            temperature=temperature,
-            google_api_key=get_google_api_key(),
-        )
+        self._temperature: float = temperature
+        self._api_key: str = get_google_api_key()
+        # Per-model LLM clients are built lazily and cached for the cascade.
+        self._model_clients: dict = {}
+        self._llm: ChatGoogleGenerativeAI = self._cascade_llm(GEMINI_MODEL_NAME)
         LOGGER.info(
-            "RAG service online: model=%s top_k=%d grounding_gate=%.2f",
-            GEMINI_MODEL_NAME, self.top_k, self.max_grounding_distance,
+            "RAG service online: cascade=%s top_k=%d grounding_gate=%.2f",
+            MODEL_CASCADE_ORDER, self.top_k, self.max_grounding_distance,
         )
+
+    def _cascade_llm(self, model_name: str) -> ChatGoogleGenerativeAI:
+        """Return (and cache) a chat LLM client for one model id."""
+        if model_name not in self._model_clients:
+            self._model_clients[model_name] = ChatGoogleGenerativeAI(
+                model=model_name,
+                temperature=self._temperature,
+                google_api_key=self._api_key,
+            )
+        return self._model_clients[model_name]
+
+    async def cascade_invoke(
+        self, messages: List[object], origin: str = "synthesis"
+    ) -> str:
+        """Invoke the LLM, rotating models on 429 exhaustion.
+
+        Returns the model's answer on success; ``QUOTA_EXHAUSTED_MESSAGE`` when
+        every model is quota-exhausted (a user-facing markdown string, never a
+        traceback); or "" on a non-quota failure. Respects the per-call
+        asyncio timeout for every attempt.
+        """
+        last: int = len(MODEL_CASCADE_ORDER) - 1
+        quota_hits: int = 0
+        for index, model_name in enumerate(MODEL_CASCADE_ORDER):
+            next_model: str = (
+                MODEL_CASCADE_ORDER[index + 1] if index < last
+                else "(none — cascade exhausted)"
+            )
+            try:
+                completion = await asyncio.wait_for(
+                    self._cascade_llm(model_name).ainvoke(messages),
+                    timeout=INFERENCE_TIMEOUT_SECONDS,
+                )
+                return _content_to_text(completion.content)
+            except asyncio.TimeoutError:
+                LOGGER.warning("%s: model %s timed out — shifting to %s",
+                               origin, model_name, next_model)
+                continue
+            except GoogleGenerativeAIError as exc:
+                if _is_quota_error(exc):
+                    quota_hits += 1
+                    LOGGER.warning(
+                        "Model %s exhausted its free-tier pool (429) - shifting "
+                        "to next fallback endpoint...", model_name)
+                else:
+                    LOGGER.warning("%s: model %s unavailable (%s) — shifting to %s",
+                                   origin, model_name, type(exc).__name__, next_model)
+                continue
+            except ValueError:
+                LOGGER.warning("%s: model %s payload fault — shifting to %s",
+                               origin, model_name, next_model)
+                continue
+        if quota_hits > 0:
+            LOGGER.error("%s: all %d models quota-exhausted — returning "
+                         "user-facing notice", origin, len(MODEL_CASCADE_ORDER))
+            return QUOTA_EXHAUSTED_MESSAGE
+        return ""
 
     # -- Step 4.2: semantic retrieval --------------------------------------- #
 
@@ -320,24 +422,24 @@ class RagService:
                 f"USER QUERY: {query.strip()}"
             )),
         ]
-        try:
-            completion = await asyncio.wait_for(
-                self._llm.ainvoke(messages),
-                timeout=INFERENCE_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            LOGGER.error("Inference timed out for query=%r", query[:80])
-            return self._fallback_payload(query, chunks, "inference_timeout")
-        except GoogleGenerativeAIError:
-            LOGGER.exception("Gemini API fault for query=%r", query[:80])
-            return self._fallback_payload(query, chunks, "llm_api_fault")
-        except ValueError:
-            LOGGER.exception("Inference payload anomaly for query=%r", query[:80])
-            return self._fallback_payload(query, chunks, "payload_anomaly")
-
-        answer: str = str(completion.content).strip()
+        # Guarded generation through the multi-model cascade: 429-resilient and
+        # content-normalized. The 0.70 grounding gate above already ran, so the
+        # safety boundary is intact regardless of which model answers.
+        answer: str = await self.cascade_invoke(messages, origin="guarded")
+        if answer == QUOTA_EXHAUSTED_MESSAGE:
+            LOGGER.error("Guarded inference: every model quota-exhausted for "
+                         "query=%r", query[:80])
+            return {
+                "answer": QUOTA_EXHAUSTED_MESSAGE,
+                "citations": [],
+                "grounded": False,
+                "fallback_reason": "quota_exhausted",
+                "chunks_retrieved": len(chunks),
+                "query": query,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
         if not answer:
-            return self._fallback_payload(query, chunks, "empty_completion")
+            return self._fallback_payload(query, chunks, "llm_api_fault")
         refused: bool = RAG_FALLBACK_MESSAGE in answer
         response: Dict[str, object] = {
             "answer": RAG_FALLBACK_MESSAGE if refused else answer,
@@ -639,20 +741,9 @@ async def synthesize_answer(
         SystemMessage(content=prompt),
         HumanMessage(content=f"CONTEXT SNIPPETS:\n\n{context}\n\nQUESTION: {query}"),
     ]
-    try:
-        completion = await asyncio.wait_for(
-            service._llm.ainvoke(messages), timeout=INFERENCE_TIMEOUT_SECONDS
-        )
-        answer: str = str(completion.content).strip()
-    except asyncio.TimeoutError:
-        LOGGER.error("synthesis timed out for query=%r", query[:80])
-        answer = ""
-    except GoogleGenerativeAIError:
-        LOGGER.exception("synthesis Gemini fault for query=%r", query[:80])
-        answer = ""
-    except ValueError:
-        LOGGER.exception("synthesis payload fault for query=%r", query[:80])
-        answer = ""
+    # Multi-model cascade: rotates through MODEL_CASCADE_ORDER on 429, and
+    # returns a user-facing notice (not a traceback) if all are exhausted.
+    answer: str = await service.cascade_invoke(messages, origin="synthesis")
     LOGGER.info("synthesis complete: web_augmented=%s corpus=%d web=%d query=%r",
                 web_augmented, len(top), len(web_results), query[:80])
     return {
