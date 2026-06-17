@@ -55,6 +55,23 @@ EXTRACTION_TIMEOUT_SECONDS: float = 120.0
 # Gemini context is large but we cap input defensively to control cost/latency.
 MAX_INPUT_CHARS: int = 24_000
 
+# Multi-model rotation: the Gemini free-tier daily cap is PER MODEL, so when one
+# model exhausts its pool we cascade to the next — each has its own daily quota.
+MODEL_CASCADE_ORDER: List[str] = [
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    """True if the error is a 429 / RESOURCE_EXHAUSTED quota exhaustion."""
+    message: str = str(exc)
+    return ("429" in message or "RESOURCE_EXHAUSTED" in message
+            or "exceeded your current quota" in message.lower())
+
 
 class FraudRecordExtraction(BaseModel):
     """One structured fraud-landscape datapoint synthesized from text."""
@@ -201,20 +218,31 @@ SYSTEM_DIRECTIVE: str = (
 
 
 class ResearchExtractor:
-    """Gemini-backed structured extractor for the research repository."""
+    """Gemini-backed structured extractor with multi-model rotation fallback."""
 
     def __init__(self, temperature: float = 0.0) -> None:
-        self._llm = ChatGoogleGenerativeAI(
-            model=GEMINI_MODEL_NAME,
-            temperature=temperature,
-            google_api_key=get_google_api_key(),
-        ).with_structured_output(FraudExtractionBatch)
-        LOGGER.info("Research extractor online: model=%s", GEMINI_MODEL_NAME)
+        self._temperature: float = temperature
+        self._api_key: str = get_google_api_key()
+        # Per-model structured LLMs are built lazily and cached so we never
+        # reconstruct the same client across documents.
+        self._structured: dict = {}
+        LOGGER.info("Research extractor online: model cascade=%s",
+                    MODEL_CASCADE_ORDER)
+
+    def _structured_llm(self, model_name: str):
+        """Return (and cache) a structured-output LLM for one model id."""
+        if model_name not in self._structured:
+            self._structured[model_name] = ChatGoogleGenerativeAI(
+                model=model_name,
+                temperature=self._temperature,
+                google_api_key=self._api_key,
+            ).with_structured_output(FraudExtractionBatch)
+        return self._structured[model_name]
 
     async def extract(
         self, raw_text: str, origin: str = "unknown"
     ) -> FraudExtractionBatch:
-        """Synthesize one raw document into structured fraud datapoints."""
+        """Synthesize one raw document, cascading models on 429 exhaustion."""
         if not raw_text or not raw_text.strip():
             return FraudExtractionBatch.empty()
         payload: str = raw_text.strip()[:MAX_INPUT_CHARS]
@@ -222,25 +250,40 @@ class ResearchExtractor:
             SystemMessage(content=SYSTEM_DIRECTIVE),
             HumanMessage(content=f"RAW DOCUMENT:\n\n{payload}"),
         ]
-        try:
-            result: Optional[FraudExtractionBatch] = await asyncio.wait_for(
-                self._llm.ainvoke(messages),
-                timeout=EXTRACTION_TIMEOUT_SECONDS,
+        last: int = len(MODEL_CASCADE_ORDER) - 1
+        for index, model_name in enumerate(MODEL_CASCADE_ORDER):
+            next_model: str = (
+                MODEL_CASCADE_ORDER[index + 1] if index < last
+                else "(none — cascade exhausted)"
             )
-        except asyncio.TimeoutError:
-            LOGGER.error("origin=%s: extraction timed out", origin)
-            return FraudExtractionBatch.empty()
-        except GoogleGenerativeAIError:
-            LOGGER.exception("origin=%s: Gemini API fault", origin)
-            return FraudExtractionBatch.empty()
-        except ValidationError:
-            LOGGER.exception("origin=%s: Pydantic validation anomaly", origin)
-            return FraudExtractionBatch.empty()
-        except ValueError:
-            LOGGER.exception("origin=%s: structured-output parse fault", origin)
-            return FraudExtractionBatch.empty()
-        if result is None:
-            return FraudExtractionBatch.empty()
-        LOGGER.info("origin=%s: extracted %d datapoints",
-                    origin, len(result.records))
-        return result
+            try:
+                result: Optional[FraudExtractionBatch] = await asyncio.wait_for(
+                    self._structured_llm(model_name).ainvoke(messages),
+                    timeout=EXTRACTION_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                LOGGER.warning("origin=%s: model %s timed out — shifting to %s",
+                               origin, model_name, next_model)
+                continue
+            except GoogleGenerativeAIError as exc:
+                if _is_quota_error(exc):
+                    LOGGER.warning(
+                        "origin=%s: model %s exhausted its free-tier pool (429) "
+                        "— shifting to %s", origin, model_name, next_model)
+                else:
+                    LOGGER.warning(
+                        "origin=%s: model %s unavailable (%s) — shifting to %s",
+                        origin, model_name, type(exc).__name__, next_model)
+                continue
+            except (ValidationError, ValueError):
+                LOGGER.warning("origin=%s: model %s parse/validation fault — "
+                               "shifting to %s", origin, model_name, next_model)
+                continue
+            if result is None:
+                continue
+            LOGGER.info("origin=%s: extracted %d datapoints via %s",
+                        origin, len(result.records), model_name)
+            return result
+        LOGGER.error("origin=%s: entire model cascade exhausted — empty batch",
+                     origin)
+        return FraudExtractionBatch.empty()
