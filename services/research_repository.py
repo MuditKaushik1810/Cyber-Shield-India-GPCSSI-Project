@@ -263,6 +263,11 @@ def _demo_clause(exclude_demo: bool) -> str:
 # Restricts the technical (Digital & Infrastructure) aggregations to the
 # non-financial threat domains so they never touch the financial dashboard.
 _NON_FINANCIAL: str = "AND threat_domain != 'Financial Fraud' "
+# Same predicate as a leading WHERE clause. The technical section displays ALL
+# non-financial rows regardless of the is_isolated_incident flag or source
+# (worker vs RAG session) — only the financial charts apply isolated-only so
+# cumulative macro figures cannot inflate currency windows.
+_NON_FINANCIAL_LEAD: str = "threat_domain != 'Financial Fraud' "
 
 
 def geospatial_hotspots(
@@ -534,17 +539,17 @@ def domain_kpis(
     try:
         totals: sqlite3.Row = connection.execute(
             f"SELECT SUM(records_exposed) AS records, "
-            f"  SUM(incident_count) AS incidents, "
+            f"  SUM(COALESCE(incident_count, 1)) AS incidents, "
             f"  COUNT(DISTINCT threat_domain) AS domains "
             f"FROM fraud_records "
-            f"WHERE {_ISOLATED_ONLY} {demo}{_NON_FINANCIAL}AND {_DATE_EXPR} >= ?",
+            f"WHERE {_NON_FINANCIAL_LEAD}{demo}AND {_DATE_EXPR} >= ?",
             (cutoff,),
         ).fetchone()
         rows: List[sqlite3.Row] = connection.execute(
             f"SELECT threat_domain AS domain, COUNT(*) AS n, "
             f"  SUM(records_exposed) AS records "
             f"FROM fraud_records "
-            f"WHERE {_ISOLATED_ONLY} {demo}{_NON_FINANCIAL}AND {_DATE_EXPR} >= ? "
+            f"WHERE {_NON_FINANCIAL_LEAD}{demo}AND {_DATE_EXPR} >= ? "
             f"GROUP BY threat_domain ORDER BY n DESC",
             (cutoff,),
         ).fetchall()
@@ -573,7 +578,7 @@ def records_by_sector(
             f"SELECT COALESCE(target_sector, 'Unspecified') AS sector, "
             f"  SUM(records_exposed) AS records, COUNT(*) AS incidents "
             f"FROM fraud_records "
-            f"WHERE {_ISOLATED_ONLY} {demo}{_NON_FINANCIAL}"
+            f"WHERE {_NON_FINANCIAL_LEAD}{demo}"
             f"  AND records_exposed IS NOT NULL AND {_DATE_EXPR} >= ? "
             f"GROUP BY COALESCE(target_sector, 'Unspecified') "
             f"ORDER BY records DESC",
@@ -599,7 +604,7 @@ def incidents_by_domain(
             f"SELECT threat_domain AS domain, "
             f"  SUM(COALESCE(incident_count, 1)) AS incidents "
             f"FROM fraud_records "
-            f"WHERE {_ISOLATED_ONLY} {demo}{_NON_FINANCIAL}AND {_DATE_EXPR} >= ? "
+            f"WHERE {_NON_FINANCIAL_LEAD}{demo}AND {_DATE_EXPR} >= ? "
             f"GROUP BY threat_domain ORDER BY incidents DESC",
             (cutoff,),
         ).fetchall()
@@ -632,7 +637,7 @@ def asset_log(
             f"    AS compromised_assets, "
             f"  source_url "
             f"FROM fraud_records "
-            f"WHERE {_ISOLATED_ONLY} {demo}{_NON_FINANCIAL}AND {_DATE_EXPR} >= ? "
+            f"WHERE {_NON_FINANCIAL_LEAD}{demo}AND {_DATE_EXPR} >= ? "
             f"ORDER BY ingested_at DESC LIMIT ?",
             (cutoff, limit),
         ).fetchall()
