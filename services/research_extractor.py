@@ -19,7 +19,7 @@ from typing import List, Literal, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_google_genai._common import GoogleGenerativeAIError
+from services.llm_errors import LLM_TRANSIENT_ERRORS, is_server_busy
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from core.config import get_google_api_key
@@ -265,10 +265,14 @@ class ResearchExtractor:
                 LOGGER.warning("origin=%s: model %s timed out — shifting to %s",
                                origin, model_name, next_model)
                 continue
-            except GoogleGenerativeAIError as exc:
+            except LLM_TRANSIENT_ERRORS as exc:
                 if _is_quota_error(exc):
                     LOGGER.warning(
                         "origin=%s: model %s exhausted its free-tier pool (429) "
+                        "— shifting to %s", origin, model_name, next_model)
+                elif is_server_busy(exc):
+                    LOGGER.warning(
+                        "origin=%s: model %s experiencing high demand (503) "
                         "— shifting to %s", origin, model_name, next_model)
                 else:
                     LOGGER.warning(

@@ -36,7 +36,8 @@ from typing import Dict, List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_google_genai._common import GoogleGenerativeAIError
+
+from services.llm_errors import LLM_TRANSIENT_ERRORS, is_server_busy
 
 from core.config import get_google_api_key
 from core.database import VectorStoreManager
@@ -269,12 +270,15 @@ class RagService:
                 LOGGER.warning("%s: model %s timed out — shifting to %s",
                                origin, model_name, next_model)
                 continue
-            except GoogleGenerativeAIError as exc:
+            except LLM_TRANSIENT_ERRORS as exc:
                 if _is_quota_error(exc):
                     quota_hits += 1
                     LOGGER.warning(
                         "Model %s exhausted its free-tier pool (429) - shifting "
                         "to next fallback endpoint...", model_name)
+                elif is_server_busy(exc):
+                    LOGGER.warning("%s: model %s experiencing high demand (503) "
+                                   "— shifting to %s", origin, model_name, next_model)
                 else:
                     LOGGER.warning("%s: model %s unavailable (%s) — shifting to %s",
                                    origin, model_name, type(exc).__name__, next_model)

@@ -11,13 +11,16 @@ the briefing always renders even when the LLM is unavailable.
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_google_genai._common import GoogleGenerativeAIError
 
-from core.config import get_google_api_key
+from core.config import GEMINI_FLASH_MODEL as _FLASH, get_google_api_key
+# Using an explicit relative import clears the IDE linter path resolution error
+from .llm_errors import (
+    LLM_TRANSIENT_ERRORS, content_to_text, is_quota_error, is_transient,
+)
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 LOG_DIR: Path = PROJECT_ROOT / "logs"
@@ -44,8 +47,17 @@ def _build_logger() -> logging.Logger:
 
 LOGGER: logging.Logger = _build_logger()
 
-from core.config import GEMINI_FLASH_MODEL as _FLASH
 GEMINI_MODEL_NAME: str = _FLASH
+
+# Multi-model rotation: the Gemini free-tier daily cap is per-model, and 503
+# 'high demand' errors are transient — both warrant shifting to the next model.
+MODEL_CASCADE_ORDER: List[str] = [
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
 
 INTERVAL_PHRASES: Dict[str, str] = {
     "1d": "the past 24 hours", "1w": "the past week",
@@ -103,28 +115,44 @@ def generate_briefing(stats: Dict[str, object], interval: str) -> str:
         return ("No telemetry is available for this filter window yet. Widen "
                 "the chronological range or explore another threat domain.")
     fallback: str = _template_briefing(stats, interval)
-    try:
-        llm = ChatGoogleGenerativeAI(
-            model=GEMINI_MODEL_NAME, temperature=0.3,
-            google_api_key=get_google_api_key(),
-        )
-        completion = llm.invoke([
-            SystemMessage(content=BRIEFING_PROMPT),
-            HumanMessage(content=(
-                f"Window: {INTERVAL_PHRASES.get(interval, interval)}\n"
-                f"Total cases: {stats.get('total_cases')}\n"
-                f"Total loss (INR): {stats.get('total_loss')}\n"
-                f"Previous-window cases: {stats.get('prev_cases')}\n"
-                f"Volume change vs previous window (%): {stats.get('volume_delta_pct')}\n"
-                f"Top state by loss: {stats.get('top_state')} "
-                f"({stats.get('top_state_cases')} cases, "
-                f"INR {stats.get('top_state_loss')})\n"
-                f"Top scam vector by loss: {stats.get('top_vector')} "
-                f"(INR {stats.get('top_vector_loss')})"
-            )),
-        ])
-        text: str = str(completion.content).strip()
-        return text or fallback
-    except (GoogleGenerativeAIError, RuntimeError, ValueError):
-        LOGGER.exception("briefing generation failed — using template fallback")
-        return fallback
+    api_key: str = get_google_api_key()
+    messages = [
+        SystemMessage(content=BRIEFING_PROMPT),
+        HumanMessage(content=(
+            f"Window: {INTERVAL_PHRASES.get(interval, interval)}\n"
+            f"Total cases: {stats.get('total_cases')}\n"
+            f"Total loss (INR): {stats.get('total_loss')}\n"
+            f"Previous-window cases: {stats.get('prev_cases')}\n"
+            f"Volume change vs previous window (%): {stats.get('volume_delta_pct')}\n"
+            f"Top state by loss: {stats.get('top_state')} "
+            f"({stats.get('top_state_cases')} cases, "
+            f"INR {stats.get('top_state_loss')})\n"
+            f"Top scam vector by loss: {stats.get('top_vector')} "
+            f"(INR {stats.get('top_vector_loss')})"
+        )),
+    ]
+    # Cascade across models on a 429 (quota) OR a 503 ('high demand') — both
+    # are transient. Content is normalized so the signature/block list can never
+    # leak into the banner. If every model is unavailable, the deterministic
+    # template renders, so the briefing never crashes the page.
+    for model_name in MODEL_CASCADE_ORDER:
+        try:
+            llm = ChatGoogleGenerAI(
+                model=model_name, temperature=0.3, google_api_key=api_key,
+            )
+            completion = llm.invoke(messages)
+            text: str = content_to_text(completion.content)
+            return text or fallback
+        except LLM_TRANSIENT_ERRORS as exc:
+            reason: str = ("exhausted its free-tier pool (429)"
+                           if is_quota_error(exc) else "is experiencing high "
+                           "demand (503)") if is_transient(exc) else \
+                          f"failed ({type(exc).__name__})"
+            LOGGER.warning("briefing: model %s %s — shifting to next fallback",
+                           model_name, reason)
+            continue
+        except (RuntimeError, ValueError):
+            LOGGER.warning("briefing: model %s payload fault — shifting", model_name)
+            continue
+    LOGGER.error("briefing: all models unavailable — deterministic fallback")
+    return fallback
