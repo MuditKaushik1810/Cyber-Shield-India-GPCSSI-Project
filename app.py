@@ -21,6 +21,7 @@ Run:  streamlit run app.py     (worker: python ingestion_worker.py)
 import asyncio
 import io
 import logging
+import re
 from datetime import datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -32,7 +33,32 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from services import research_repository as rr
+from services import cdr_analyzer
+from services import victim_triage
 from services.research_agent import AnalyticalPlan, ResearchAgent, run_select
+
+# Navigation registry — single source of truth for the home grid + top nav.
+# (key, icon, title, one-line blurb, "ready" flag for this build phase).
+NAV_FEATURES: List[Tuple[str, str, str, str, bool]] = [
+    ("macro", "📊", "Macro Trends",
+     "Geospatial hot-spots, scam-vector landscape, demographic matrix and the "
+     "localized state tracker under one chronological filter.", True),
+    ("explorer", "🔎", "Semantic Explorer",
+     "Ask deep research questions across the curated advisory corpus or render "
+     "custom analytical charts from natural language.", True),
+    ("triage", "🚨", "Victim Triage & First-Action",
+     "Narrate an incident, hash your proofs for chain-of-custody, and get the "
+     "BNS/IT-Act mapping plus a ready-to-send complaint.", True),
+    ("cdr", "📞", "CDR & IPDR Analyzer",
+     "Upload call/IP detail records for Pandas-driven B-party, odd-hour and "
+     "IMEI/IMSI link analysis with a forensic AI breakdown.", True),
+    ("osint", "🕵️", "OSINT Sandbox",
+     "Deterministic email-header forensics, WHOIS, EXIF/GPS, breach checks and "
+     "URL reputation in one investigator workspace.", False),
+    ("lab", "🎓", "Case-Building Practice Lab",
+     "Level-based mock investigations with a Section-94 BNSS legal-notice "
+     "drafting engine.", False),
+]
 
 # --------------------------------------------------------------------------- #
 # Frontend telemetry — daily-rotating channel: logs/frontend.log.             #
@@ -201,6 +227,50 @@ section[data-testid="stSidebar"] [data-testid="stFileUploader"] button {
 section[data-testid="stSidebar"] [data-testid="stFileUploader"] button:hover {
     background-color: #0C8AE0 !important;
 }
+/* === Home feature-card grid =========================================== */
+.cs-card {
+    border: 1px solid #1E3A5F; border-top: 4px solid #0A74B9;
+    border-radius: 10px; padding: 16px 18px 10px 18px; margin: 4px 0 2px 0;
+    background: linear-gradient(160deg, #0F2537 0%, #15324D 100%);
+    min-height: 188px; box-shadow: 0 2px 8px rgba(8,20,33,0.35);
+}
+.cs-card .cs-card-ico { font-size: 1.7rem; line-height: 1; }
+.cs-card h4 { color: #F8F9FA; font-size: 1.0rem; margin: 8px 0 4px 0;
+    letter-spacing: 0.03em; font-weight: 700; }
+.cs-card p { color: #B9CFE0; font-size: 0.8rem; line-height: 1.45;
+    margin: 0 0 8px 0; }
+.cs-card .cs-card-tag {
+    display: inline-block; background: #0A74B9; color: #FFFFFF;
+    font-size: 0.62rem; font-weight: 700; letter-spacing: 0.08em;
+    border-radius: 999px; padding: 2px 9px; text-transform: uppercase;
+}
+.cs-card .cs-card-tag.soon { background: #4B5C6B; }
+/* === Triage / forensic output panels ================================== */
+.cs-legal {
+    border: 1px solid #D1E3F0; border-left: 4px solid #0A74B9;
+    border-radius: 6px; padding: 8px 14px; margin: 6px 0; background: #FFFFFF;
+    font-size: 0.82rem; color: #1F2937;
+}
+.cs-legal b { color: #0A74B9; }
+.cs-hash {
+    border: 1px solid #1E3A5F; border-radius: 6px; padding: 6px 12px;
+    margin: 4px 0; background: #0F2537; color: #9FE2B0;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.72rem;
+    word-break: break-all;
+}
+.cs-golden {
+    border: 1px solid #E0A800; border-left: 5px solid #E0A800;
+    border-radius: 8px; padding: 12px 16px; margin: 8px 0;
+    background: #FFF8E6; color: #7A5C00; font-size: 0.84rem; line-height: 1.5;
+}
+.cs-sev {
+    display: inline-block; border-radius: 999px; padding: 2px 12px;
+    font-size: 0.72rem; font-weight: 800; letter-spacing: 0.08em; color: #FFFFFF;
+}
+.cs-sev.critical { background: #B91C1C; }
+.cs-sev.high { background: #D9730D; }
+.cs-sev.medium { background: #0A74B9; }
+.cs-sev.low { background: #15803D; }
 </style>
 """
 
@@ -1108,9 +1178,9 @@ def _query_sandbox(question: str) -> None:
     context: str = "\n\n".join(documents)
     from langchain_core.messages import HumanMessage, SystemMessage
     from langchain_google_genai import ChatGoogleGenerativeAI
-    from langchain_google_genai._common import GoogleGenerativeAIError
     from core.config import GEMINI_FLASH_MODEL as _SANDBOX_FLASH
     from core.config import get_google_api_key
+    from services.llm_errors import LLM_TRANSIENT_ERRORS, content_to_text
     try:
         llm = ChatGoogleGenerativeAI(
             model=_SANDBOX_FLASH, temperature=0.1,
@@ -1123,8 +1193,11 @@ def _query_sandbox(question: str) -> None:
                 "so plainly. Do not use outside knowledge.")),
             HumanMessage(content=f"EXCERPTS:\n{context}\n\nQUESTION: {question}"),
         ])
-        st.markdown(str(completion.content))
-    except (GoogleGenerativeAIError, RuntimeError, ValueError):
+        st.markdown(content_to_text(completion.content))
+    except LLM_TRANSIENT_ERRORS:
+        LOGGER.warning("sandbox query: model busy/quota-limited")
+        st.info("The AI is at capacity right now — please retry in a moment.")
+    except (RuntimeError, ValueError):
         LOGGER.exception("sandbox query failed")
         st.error("Could not query the uploaded document right now.")
 
@@ -1176,6 +1249,352 @@ def render_explorer_tab() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Navigation — session-state driven views (cards & top nav both drive this).  #
+# --------------------------------------------------------------------------- #
+
+
+def _active_view() -> str:
+    """Return the currently selected view key (defaults to the home grid)."""
+    return st.session_state.get("active_view", "home")
+
+
+def _go_to(view_key: str) -> None:
+    """Switch the active view and rerun so navigation feels seamless."""
+    st.session_state["active_view"] = view_key
+    st.rerun()
+
+
+def render_top_nav() -> None:
+    """Persistent horizontal nav bar mirroring the home feature grid."""
+    keys: List[Tuple[str, str]] = [("home", "🏠 Home")] + [
+        (key, f"{icon} {title.split(' & ')[0].split(' (')[0]}")
+        for key, icon, title, _blurb, _ready in NAV_FEATURES
+    ]
+    active: str = _active_view()
+    cols: List[object] = st.columns(len(keys))
+    for col, (key, label) in zip(cols, keys):
+        with col:
+            if st.button(label, key=f"nav_{key}", use_container_width=True,
+                         type="primary" if key == active else "secondary"):
+                if key != active:
+                    _go_to(key)
+
+
+def render_home(corpus: int) -> None:
+    """Landing grid: one styled, clickable card per feature."""
+    st.markdown("#### 🛰️ Operational Modules")
+    st.caption(
+        "A unified investigator console for the Cyber Shield India grid. "
+        "Select a module below or use the navigation bar above — every AI "
+        "module is hardened by a multi-model cascade, so transient model load "
+        "never interrupts an investigation."
+    )
+    hero: List[object] = st.columns(3)
+    hero[0].metric("Curated datapoints", f"{corpus:,}")
+    hero[1].metric("Live modules", str(sum(1 for *_x, r in NAV_FEATURES if r)))
+    hero[2].metric("NCRP helpline", victim_triage.NCRP_HELPLINE)
+    st.markdown("")
+    per_row: int = 3
+    for start in range(0, len(NAV_FEATURES), per_row):
+        row: List[Tuple[str, str, str, str, bool]] = NAV_FEATURES[start:start + per_row]
+        cols: List[object] = st.columns(per_row)
+        for col, (key, icon, title, blurb, ready) in zip(cols, row):
+            with col:
+                tag: str = ("<span class='cs-card-tag'>LIVE</span>" if ready
+                            else "<span class='cs-card-tag soon'>NEXT BUILD</span>")
+                st.markdown(
+                    f"<div class='cs-card'><div class='cs-card-ico'>{icon}</div>"
+                    f"<h4>{title}</h4><p>{blurb}</p>{tag}</div>",
+                    unsafe_allow_html=True,
+                )
+                label: str = "Open ▸" if ready else "Preview ▸"
+                if st.button(label, key=f"card_{key}", use_container_width=True):
+                    _go_to(key)
+
+
+# --------------------------------------------------------------------------- #
+# Feature 1 — Victim Triage & First-Action Guide.                            #
+# --------------------------------------------------------------------------- #
+
+
+def _split_list(raw: str) -> List[str]:
+    """Split a comma / newline / space separated field into clean tokens."""
+    if not raw:
+        return []
+    tokens: List[str] = re.split(r"[,\n;]+", raw)
+    flat: List[str] = []
+    for token in tokens:
+        flat.extend(part for part in token.split() if part.strip())
+    seen: Dict[str, None] = {}
+    for item in (t.strip() for t in flat if t.strip()):
+        seen.setdefault(item, None)
+    return list(seen.keys())
+
+
+def _render_evidence_custody(files: List[object]) -> int:
+    """Hash each uploaded proof (SHA-256) and render the chain-of-custody log."""
+    if not files:
+        return 0
+    st.markdown("**🔐 Evidence chain-of-custody (SHA-256 logged on upload):**")
+    for uploaded in files:
+        payload: bytes = uploaded.getvalue()
+        record: Dict[str, object] = victim_triage.hash_evidence(uploaded.name, payload)
+        st.markdown(
+            f"<div class='cs-hash'>📎 {record['filename']} · "
+            f"{record['size_bytes']:,} bytes · {record['logged_utc']}<br>"
+            f"SHA-256: {record['sha256']}</div>",
+            unsafe_allow_html=True,
+        )
+        LOGGER.info("triage evidence hashed: %s sha256=%s",
+                    record["filename"], record["sha256"])
+    return len(files)
+
+
+def _render_assessment(assessment: victim_triage.TriageAssessment) -> None:
+    """Render the full first-action package returned by the triage engine."""
+    sev: str = assessment.severity.lower()
+    sev_class: str = sev if sev in {"critical", "high", "medium", "low"} else "medium"
+    provenance: str = ("AI cascade" if assessment.source == "ai-cascade"
+                       else "Deterministic statutory engine (AI at capacity)")
+    st.markdown(
+        f"<span class='cs-sev {sev_class}'>{assessment.severity.upper()}</span> "
+        f"&nbsp;<b>{assessment.vector_label}</b> "
+        f"&nbsp;<span style='color:#7FA8C9;font-size:0.74rem'>· {provenance}</span>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(f"<div class='cs-briefing'>{assessment.summary}</div>",
+                unsafe_allow_html=True)
+
+    if assessment.golden_hour_applicable:
+        st.markdown(
+            f"<div class='cs-golden'>⏱️ <b>GOLDEN HOUR — ACT NOW.</b> "
+            f"{victim_triage.GOLDEN_HOUR_NOTE}</div>",
+            unsafe_allow_html=True,
+        )
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("##### ⚖️ Applicable legal framework")
+        for prov in assessment.legal_provisions:
+            st.markdown(
+                f"<div class='cs-legal'><b>{prov.statute} — {prov.section}</b><br>"
+                f"<i>{prov.title}.</i> {prov.relevance}</div>",
+                unsafe_allow_html=True,
+            )
+    with right:
+        st.markdown("##### 🚑 Immediate actions")
+        for step in assessment.immediate_actions:
+            st.markdown(f"- {step}")
+        st.markdown("##### 📢 Advisories")
+        for note in assessment.advisories:
+            st.markdown(f"- {note}")
+
+    st.markdown(
+        f"##### 🆘 Official channels &nbsp;"
+        f"<span class='cs-domainchip'>Helpline {victim_triage.NCRP_HELPLINE}</span>"
+        f"<span class='cs-domainchip'>{victim_triage.NCRP_PORTAL}</span>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("##### ✉️ Ready-to-send complaint")
+    st.text_input("Subject", value=assessment.complaint_subject,
+                  key="triage_subject")
+    st.caption("Use the copy icon on the block below, or download as a file.")
+    st.code(assessment.complaint_body, language="text")
+    st.download_button(
+        "⬇️ Download complaint (.txt)", data=assessment.complaint_body,
+        file_name="cyber_complaint.txt", mime="text/plain",
+        use_container_width=True,
+    )
+
+
+def render_triage_tab() -> None:
+    """Feature 1 — Victim Triage & First-Action Guide."""
+    st.markdown("#### 🚨 Victim Triage & First-Action Guide")
+    st.caption(
+        "Narrate what happened in plain English or Hinglish. Attach proofs to "
+        "lock their cryptographic hashes for chain-of-custody, add any known "
+        "identifiers, and get an instant legal classification (BNS 2023 / IT "
+        "Act 2000), Golden-Hour banking guidance and a ready-to-file complaint."
+    )
+
+    narrative: str = st.text_area(
+        "Describe the incident",
+        height=150,
+        placeholder="e.g. Mujhe ek call aaya CBI officer ka, video call pe "
+                    "digital arrest bola, dar ke maine ₹50,000 UPI kiya, "
+                    "transaction ID HDFC0098765432…",
+    )
+    proofs: List[object] = st.file_uploader(
+        "Attach proofs (screenshots, receipts, chat logs)",
+        type=["png", "jpg", "jpeg", "pdf", "txt", "csv", "eml", "webp"],
+        accept_multiple_files=True,
+    ) or []
+    evidence_count: int = _render_evidence_custody(proofs)
+
+    with st.expander("➕ Add known identifiers (optional, improves accuracy)",
+                     expanded=False):
+        col_a, col_b = st.columns(2)
+        txn_raw: str = col_a.text_area(
+            "Transaction / UTR IDs", height=70,
+            placeholder="one per line or comma-separated")
+        url_raw: str = col_b.text_area(
+            "Malicious URLs / handles", height=70,
+            placeholder="https://… , scammer@upi")
+        phone_raw: str = col_a.text_area(
+            "Suspect phone numbers", height=70, placeholder="+91…")
+        amount_lost: str = col_b.text_input("Amount lost (₹)", placeholder="50000")
+        money_lost: bool = col_b.checkbox("Money was actually transferred",
+                                         value=False)
+        name_col, contact_col = st.columns(2)
+        complainant_name: str = name_col.text_input("Your name (for the complaint)")
+        complainant_contact: str = contact_col.text_input(
+            "Your contact (phone / email)")
+
+    if st.button("🛡️ Analyze & Build First-Action Plan", type="primary",
+                 use_container_width=True):
+        if not narrative.strip():
+            st.warning("Please describe the incident before analyzing.")
+            return
+        metadata: Dict[str, object] = {
+            "transaction_ids": _split_list(txn_raw),
+            "urls": _split_list(url_raw),
+            "phones": _split_list(phone_raw),
+            "amount_lost": amount_lost.strip(),
+            "money_lost": money_lost,
+            "evidence_count": evidence_count,
+            "complainant_name": complainant_name.strip(),
+            "complainant_contact": complainant_contact.strip(),
+        }
+        with st.spinner("Classifying the incident and drafting your complaint…"):
+            assessment = victim_triage.analyze_incident(narrative.strip(), metadata)
+        st.session_state["triage_assessment"] = assessment
+        LOGGER.info("triage rendered: vector=%s severity=%s evidence=%d source=%s",
+                    assessment.threat_vector, assessment.severity,
+                    evidence_count, assessment.source)
+
+    cached = st.session_state.get("triage_assessment")
+    if isinstance(cached, victim_triage.TriageAssessment):
+        st.divider()
+        _render_assessment(cached)
+
+
+# --------------------------------------------------------------------------- #
+# Feature 2 — CDR & IPDR Operational Analyzer.                               #
+# --------------------------------------------------------------------------- #
+
+
+def _cdr_table(title: str, frame: pd.DataFrame, empty: str) -> None:
+    """Render one aggregated forensic table (or a clean empty-state note)."""
+    st.markdown(f"**{title}**")
+    if frame is None or frame.empty:
+        st.caption(empty)
+    else:
+        st.dataframe(frame, use_container_width=True, hide_index=True)
+
+
+def render_cdr_tab() -> None:
+    """Feature 2 — Pandas forensic engine over CDR/IPDR with an AI breakdown."""
+    st.markdown("#### 📞 CDR & IPDR Operational Analyzer")
+    st.caption(
+        "Upload Call Detail Records (CDR) or IP Detail Records (IPDR) as CSV or "
+        "Excel. The engine runs real Pandas analytics — B-Party frequency, "
+        "odd-hour anomalies, shared IMEI/IMSI links and spatial-temporal tower "
+        "footprints — then hands only the aggregated summaries to the AI for a "
+        "digital-forensics breakdown. For authorized investigators using their "
+        "own lawfully obtained records."
+    )
+
+    st.download_button(
+        "⬇️ Download sample schema (CSV)", data=cdr_analyzer.sample_schema_csv(),
+        file_name="cdr_ipdr_sample_schema.csv", mime="text/csv",
+        help="A valid mixed CDR+IPDR dataset you can upload immediately to test.",
+    )
+    uploaded = st.file_uploader(
+        "Upload CDR / IPDR file", type=["csv", "xlsx", "xls"],
+        accept_multiple_files=False,
+    )
+    if uploaded is None:
+        st.info("Upload a record set, or grab the sample schema above to test "
+                "with valid columns: Caller, Callee, Timestamp, Duration, Cell "
+                "Tower ID, IMEI, IMSI, Source IP, Port, Destination IP.")
+        return
+
+    try:
+        frame = cdr_analyzer.load_dataframe(uploaded.getvalue(), uploaded.name)
+        analysis = cdr_analyzer.build_analysis(frame)
+    except cdr_analyzer.CDRSchemaError as exc:
+        st.error(f"Could not analyze this file: {exc}")
+        return
+
+    signature: str = f"{uploaded.name}:{analysis.record_count}"
+    kpi: List[object] = st.columns(4)
+    kpi[0].metric("Records", f"{analysis.record_count:,}")
+    kpi[1].metric("CDR / IPDR", f"{analysis.cdr_count} / {analysis.ipdr_count}")
+    kpi[2].metric("Distinct numbers", f"{analysis.distinct_actors:,}")
+    kpi[3].metric("Odd-hour events", f"{analysis.odd_hour_events:,}")
+    st.caption(f"🕒 Time span: {analysis.time_span} · fields detected: "
+               f"{', '.join(analysis.available_fields)}")
+
+    if not analysis.busiest_hours.empty:
+        fig = px.bar(
+            analysis.busiest_hours, x="hour", y="records",
+            title="Activity by hour of day (23:00–04:00 = odd-hour window)",
+        )
+        fig.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10),
+                          xaxis=dict(dtick=1))
+        fig.add_vrect(x0=22.5, x1=23.5, fillcolor="#E0A800", opacity=0.15, line_width=0)
+        fig.add_vrect(x0=-0.5, x1=3.5, fillcolor="#E0A800", opacity=0.15, line_width=0)
+        st.plotly_chart(fig, use_container_width=True)
+
+    left, right = st.columns(2)
+    with left:
+        _cdr_table("📇 Top contacts — B-Party analysis", analysis.top_contacts,
+                   "No counterpart numbers/destinations found.")
+        _cdr_table("🌙 Odd-hour activity by number", analysis.odd_hour_by_actor,
+                   "No activity in the 23:00–04:00 window.")
+        _cdr_table("🌐 IPDR destination intelligence", analysis.ip_intel,
+                   "No IPDR / destination-IP data present.")
+    with right:
+        _cdr_table("🔗 Shared IMEI / IMSI links", analysis.shared_identity,
+                   "No shared-handset or SIM-cloning links detected.")
+        _cdr_table("📍 Co-location links (same tower, minutes apart)",
+                   analysis.co_location, "No co-location links detected.")
+        _cdr_table("🚀 Rapid tower hand-offs", analysis.rapid_handoff,
+                   "No implausibly fast tower changes detected.")
+
+    st.divider()
+    st.markdown("##### 🕵️ AI digital-forensics breakdown")
+    if st.button("🧠 Run forensic investigation", type="primary",
+                 use_container_width=True):
+        with st.spinner("Correlating aggregated patterns…"):
+            brief: str = cdr_analyzer.investigate(analysis)
+        st.session_state["cdr_brief"] = (signature, brief)
+        LOGGER.info("cdr breakdown generated for %s", signature)
+
+    cached = st.session_state.get("cdr_brief")
+    if isinstance(cached, tuple) and cached[0] == signature:
+        with st.container(border=True):
+            st.markdown(cached[1])
+
+
+def render_coming_soon(view_key: str) -> None:
+    """Honest staging panel for modules landing in the next build phase."""
+    meta = next((f for f in NAV_FEATURES if f[0] == view_key), None)
+    if meta is None:
+        st.error("Unknown module.")
+        return
+    _key, icon, title, blurb, _ready = meta
+    st.markdown(f"#### {icon} {title}")
+    st.caption(blurb)
+    st.info(
+        "This module is being implemented in the next build phase of the grid. "
+        "The home overview, Victim Triage and the CDR/IPDR Analyzer are live "
+        "now; the OSINT sandbox and the Practice Lab follow in sequence."
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Application assembly.                                                       #
 # --------------------------------------------------------------------------- #
 
@@ -1208,15 +1627,24 @@ def main() -> None:
                 "Knowledge Explorer to query live cyber-threat data while the "
                 "repository populates.")
     render_sandbox_sidebar()
-    trends_tab, explorer_tab = st.tabs([
-        "📊 Macro Trends", "🔎 Semantic Knowledge Explorer",
-    ])
-    with trends_tab:
+
+    render_top_nav()
+    st.markdown("")
+    view: str = _active_view()
+    if view == "home":
+        render_home(corpus)
+    elif view == "macro":
         render_macro_trends_tab(exclude_demo)
-    with explorer_tab:
+    elif view == "explorer":
         render_explorer_tab()
-    LOGGER.info("Frame rendered (corpus=%d, pure_operational=%s)",
-                corpus, exclude_demo)
+    elif view == "triage":
+        render_triage_tab()
+    elif view == "cdr":
+        render_cdr_tab()
+    else:  # osint / lab — staged for the next build phase
+        render_coming_soon(view)
+    LOGGER.info("Frame rendered (view=%s, corpus=%d, pure_operational=%s)",
+                view, corpus, exclude_demo)
 
 
 if __name__ == "__main__":
