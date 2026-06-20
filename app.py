@@ -34,6 +34,8 @@ import streamlit as st
 
 from services import research_repository as rr
 from services import cdr_analyzer
+from services import osint_sandbox
+from services import practice_lab
 from services import victim_triage
 from services.research_agent import AnalyticalPlan, ResearchAgent, run_select
 
@@ -54,10 +56,10 @@ NAV_FEATURES: List[Tuple[str, str, str, str, bool]] = [
      "IMEI/IMSI link analysis with a forensic AI breakdown.", True),
     ("osint", "🕵️", "OSINT Sandbox",
      "Deterministic email-header forensics, WHOIS, EXIF/GPS, breach checks and "
-     "URL reputation in one investigator workspace.", False),
+     "URL reputation in one investigator workspace.", True),
     ("lab", "🎓", "Case-Building Practice Lab",
      "Level-based mock investigations with a Section-94 BNSS legal-notice "
-     "drafting engine.", False),
+     "drafting engine.", True),
 ]
 
 # --------------------------------------------------------------------------- #
@@ -1578,6 +1580,749 @@ def render_cdr_tab() -> None:
             st.markdown(cached[1])
 
 
+# --------------------------------------------------------------------------- #
+# Feature 3 — Integrated OSINT Sandbox.                                       #
+# --------------------------------------------------------------------------- #
+
+
+def _osint_custody(filename: str, payload: bytes) -> None:
+    """Render and log a SHA-256 chain-of-custody chip for an OSINT upload."""
+    record: Dict[str, object] = osint_sandbox.hash_artifact(filename, payload)
+    st.markdown(
+        f"<div class='cs-hash'>📎 {record['filename']} · "
+        f"{record['size_bytes']:,} bytes · {record['logged_utc']}<br>"
+        f"SHA-256: {record['sha256']}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _osint_officer(tool: str, summary: str, state_key: str) -> None:
+    """Shared 'AI OSINT officer' button + cached 3-bullet operational-risk read."""
+    st.divider()
+    st.markdown("##### 🕵️ AI OSINT Intelligence Officer")
+    if st.button("🧠 Generate operational-risk read", key=f"osint_ai_{state_key}",
+                 type="primary", use_container_width=True):
+        with st.spinner("Correlating metadata into an intelligence read…"):
+            read: str = osint_sandbox.summarize_for_officer(tool, summary)
+        st.session_state[state_key] = read or (
+            "_AI cascade is at capacity — the deterministic findings above stand "
+            "on their own._")
+    cached = st.session_state.get(state_key)
+    if cached:
+        with st.container(border=True):
+            st.markdown(cached)
+
+
+_OSINT_RISK_COLOR: Dict[str, str] = {
+    "Low": "#1E7E34", "Suspicious": "#E0A800", "High": "#C0392B",
+    "Clean": "#1E7E34", "Review": "#E0A800", "Anomalous": "#C0392B",
+}
+
+
+def _osint_email_tool() -> None:
+    """Toolbed 1 — email header routing + SPF/DKIM/DMARC forensics."""
+    st.markdown("##### ✉️ Email Header Analysis")
+    st.caption(
+        "Paste the FULL raw headers (in your client: 'Show original' / 'View "
+        "source') **or a pure Base64 string** of the header/EML payload — Base64 "
+        "is auto-detected and decoded. The engine reconstructs the routing path "
+        "from every `Received` hop, reads SPF/DKIM/DMARC natively, and decodes "
+        "RFC 2047 encoded-words (`=?utf-8?B?…?=`) in the From/Subject fields. No "
+        "AI touches the parsing.")
+    raw: str = st.text_area("Raw or Base64 email headers", height=220,
+                            key="osint_email_raw",
+                            placeholder="Return-Path: …\nReceived: from … by … ;\nFrom: …")
+    if not st.button("🔎 Analyze headers", key="osint_email_run",
+                     use_container_width=True):
+        return
+    if not raw.strip():
+        st.warning("Paste the raw header block first.")
+        return
+
+    report = osint_sandbox.parse_email_headers(raw)
+    if report.decoded_from_base64:
+        st.info("🧬 Input was Base64-encoded — auto-decoded to UTF-8 before parsing.")
+    cols: List[object] = st.columns(4)
+    cols[0].metric("Routing hops", report.hop_count)
+    cols[1].metric("SPF", report.spf.upper())
+    cols[2].metric("DKIM", report.dkim.upper())
+    cols[3].metric("DMARC", report.dmarc.upper())
+    st.markdown(
+        f"**From:** `{report.from_addr}` &nbsp;·&nbsp; **Originating IP:** "
+        f"`{report.originating_ip}`<br>**Return-Path:** `{report.return_path}` "
+        f"&nbsp;·&nbsp; **Reply-To:** `{report.reply_to}`<br>**Subject:** "
+        f"{report.subject}", unsafe_allow_html=True)
+
+    if report.hops:
+        st.markdown("**📡 Routing path (chronological — origin first):**")
+        frame = pd.DataFrame([{
+            "Hop": h.index, "From": h.from_host[:40], "By": h.by_host[:40],
+            "IP": h.ip or "—", "Public": "✅" if h.is_public else "—",
+            "Protocol": h.protocol, "Timestamp": h.timestamp,
+        } for h in report.hops])
+        st.dataframe(frame, use_container_width=True, hide_index=True)
+
+    if report.flags:
+        st.markdown("**🚩 Authentication & spoofing flags:**")
+        for flag in report.flags:
+            st.markdown(f"- {flag}")
+    else:
+        st.success("No authentication or spoofing anomalies detected.")
+
+    summary: str = (
+        f"From={report.from_addr}; Return-Path={report.return_path}; "
+        f"Reply-To={report.reply_to}; Originating-IP={report.originating_ip}; "
+        f"SPF={report.spf}; DKIM={report.dkim}; DMARC={report.dmarc}; "
+        f"hops={report.hop_count}; flags={' | '.join(report.flags) or 'none'}")
+    _osint_officer("Email Header Analysis", summary, "osint_email_ai")
+
+
+def _osint_whois_tool() -> None:
+    """Toolbed 2 — domain WHOIS (python-whois with socket fallback)."""
+    st.markdown("##### 🌐 Domain WHOIS Lookup")
+    st.caption(
+        "Resolve registrar, registration age, name servers and status for any "
+        "domain. Uses `python-whois` when available and falls back to a native "
+        "socket (port 43) query — no system `whois` binary required.")
+    domain: str = st.text_input("Domain or URL", key="osint_whois_domain",
+                                placeholder="example.com")
+    if not st.button("🔎 Run WHOIS", key="osint_whois_run",
+                     use_container_width=True):
+        return
+    if not domain.strip():
+        st.warning("Enter a domain such as `example.com`.")
+        return
+
+    with st.spinner("Querying WHOIS registries…"):
+        report = osint_sandbox.whois_lookup(domain)
+    if not report.available:
+        st.error(report.error or "WHOIS lookup failed.")
+        return
+
+    st.caption(f"Source: `{report.source}`")
+    cols: List[object] = st.columns(4)
+    cols[0].metric("Registrar", report.registrar[:18] if report.registrar != "—" else "—")
+    cols[1].metric("Created", report.creation_date)
+    cols[2].metric("Expires", report.expiration_date)
+    cols[3].metric("Age (days)", report.age_days if report.age_days is not None else "—")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**🌐 Name servers**")
+        for nameserver in report.name_servers or ["—"]:
+            st.markdown(f"- `{nameserver}`")
+        st.markdown("**📌 Status**")
+        for status in report.statuses or ["—"]:
+            st.markdown(f"- {status}")
+    with right:
+        st.markdown("**🏷️ Registrant country:** "
+                    f"{report.registrant_country}")
+        st.markdown("**✉️ Contact emails**")
+        for mail in report.emails or ["—"]:
+            st.markdown(f"- `{mail}`")
+
+    if report.flags:
+        st.markdown("**🚩 Risk flags:**")
+        for flag in report.flags:
+            st.markdown(f"- {flag}")
+    if report.raw:
+        with st.expander("📄 Raw WHOIS record"):
+            st.code(report.raw[:6000], language="text")
+
+    summary: str = (
+        f"domain={report.domain}; registrar={report.registrar}; "
+        f"created={report.creation_date}; expires={report.expiration_date}; "
+        f"age_days={report.age_days}; country={report.registrant_country}; "
+        f"name_servers={', '.join(report.name_servers) or 'none'}; "
+        f"statuses={', '.join(report.statuses) or 'none'}; "
+        f"flags={' | '.join(report.flags) or 'none'}")
+    _osint_officer("Domain WHOIS", summary, "osint_whois_ai")
+
+
+def _osint_exif_tool() -> None:
+    """Toolbed 3 — image EXIF + GPS extraction."""
+    st.markdown("##### 📷 Image EXIF Metadata")
+    st.caption(
+        "Upload a JPEG/PNG/TIFF to extract camera make/model, capture software, "
+        "timestamps and — where present — embedded GPS coordinates. Every upload "
+        "is SHA-256 logged for chain-of-custody.")
+    uploaded = st.file_uploader("Upload image", type=["jpg", "jpeg", "png", "tiff", "webp"],
+                                key="osint_exif_file")
+    if uploaded is None:
+        st.info("Note: screenshots and social-media re-encodes usually have their "
+                "EXIF stripped — a finding in itself.")
+        return
+
+    payload: bytes = uploaded.getvalue()
+    _osint_custody(uploaded.name, payload)
+    report = osint_sandbox.extract_exif(payload)
+
+    img_col, meta_col = st.columns([1, 2])
+    with img_col:
+        st.image(payload, caption=report.dimensions, use_container_width=True)
+    with meta_col:
+        if not report.available:
+            st.warning(report.note)
+        else:
+            st.markdown(
+                f"**Make:** {report.make} &nbsp;·&nbsp; **Model:** {report.model}<br>"
+                f"**Software:** {report.software}<br>**Captured:** "
+                f"{report.datetime_original}", unsafe_allow_html=True)
+        if report.has_gps:
+            st.markdown(
+                f"<div class='cs-golden'>📍 <b>GPS LOCATION DISCLOSED:</b> "
+                f"{report.gps_lat}, {report.gps_lon} &nbsp; "
+                f"<a href='{report.maps_url}' target='_blank'>Open in Maps ▸</a></div>",
+                unsafe_allow_html=True)
+
+    if report.has_gps:
+        st.markdown("**🗺️ Capture location (decimal degrees from EXIF GPS):**")
+        st.map(pd.DataFrame({"lat": [report.gps_lat], "lon": [report.gps_lon]}),
+               zoom=11, use_container_width=True)
+
+    if report.available and report.tags:
+        with st.expander(f"📄 All EXIF tags ({len(report.tags)})"):
+            st.dataframe(
+                pd.DataFrame(sorted(report.tags.items()), columns=["Tag", "Value"]),
+                use_container_width=True, hide_index=True)
+    if report.flags:
+        st.markdown("**🚩 Notes:**")
+        for flag in report.flags:
+            st.markdown(f"- {flag}")
+
+    if report.available:
+        summary: str = (
+            f"make={report.make}; model={report.model}; software={report.software}; "
+            f"captured={report.datetime_original}; gps="
+            f"{report.gps_lat},{report.gps_lon}" if report.has_gps else
+            f"make={report.make}; model={report.model}; software={report.software}; "
+            f"captured={report.datetime_original}; gps=none")
+        summary += f"; flags={' | '.join(report.flags) or 'none'}"
+        _osint_officer("Image EXIF Metadata", summary, "osint_exif_ai")
+
+
+def _render_url_verdicts(text: str) -> None:
+    """Score every URL in ``text`` and render verdicts + an AI officer read."""
+    verdicts = osint_sandbox.analyze_text(text)
+    if not verdicts:
+        st.info("No URL could be extracted from that text.")
+        return
+    lines: List[str] = []
+    for verdict in verdicts:
+        color: str = _OSINT_RISK_COLOR.get(verdict.level, "#7FA8C9")
+        st.markdown(
+            f"<span class='cs-sev' style='background:{color}'>"
+            f"{verdict.level.upper()} · {verdict.risk_score}/100</span> &nbsp;"
+            f"<code>{verdict.host}</code> &nbsp;<span style='color:#7FA8C9;"
+            f"font-size:0.74rem'>({verdict.scheme})</span>",
+            unsafe_allow_html=True)
+        for flag in verdict.flags:
+            st.markdown(f"- {flag}")
+        st.markdown("")
+        lines.append(f"{verdict.url} -> {verdict.level} {verdict.risk_score}/100 "
+                     f"[{' | '.join(verdict.flags)}]")
+    _osint_officer("URL/QR Risk Checker", "\n".join(lines), "osint_url_ai")
+
+
+def _osint_url_tool() -> None:
+    """Toolbed 4 — URL/QR reputation scoring (paste a URL or upload a QR image)."""
+    st.markdown("##### 🔗 URL / QR Risk Checker")
+    st.caption(
+        "Score a URL for phishing & obfuscation tells: shorteners, punycode "
+        "look-alikes, high-abuse TLDs, brand/KYC bait keywords and tracking "
+        "parameters. Paste text directly, or upload a photo/screenshot of a QR "
+        "code — it is decoded with OpenCV's `QRCodeDetector` (real computer "
+        "vision, no mock) and the embedded URL is scored.")
+    channel: str = st.radio(
+        "Input channel", ["Paste URL / text", "Upload QR-code image"],
+        horizontal=True, key="osint_url_channel")
+
+    if channel == "Paste URL / text":
+        text: str = st.text_area("URL(s) or decoded QR text", height=110,
+                                 key="osint_url_text",
+                                 placeholder="https://paytm-kyc-update.top/login")
+        if not st.button("🔎 Check reputation", key="osint_url_run",
+                         use_container_width=True):
+            return
+        if not text.strip():
+            st.warning("Paste a URL or decoded QR string first.")
+            return
+        _render_url_verdicts(text)
+        return
+
+    uploaded = st.file_uploader("Upload QR-code image", type=["png", "jpg", "jpeg"],
+                                key="osint_qr_file")
+    if uploaded is None:
+        st.info("Upload a clear, tightly-cropped image of the QR code.")
+        return
+    payload: bytes = uploaded.getvalue()
+    _osint_custody(uploaded.name, payload)
+    img_col, res_col = st.columns([1, 2])
+    with img_col:
+        st.image(payload, caption="Uploaded QR image", use_container_width=True)
+    with res_col:
+        with st.spinner("Decoding QR matrix with OpenCV…"):
+            qr = osint_sandbox.decode_qr_image(payload)
+        if not qr.payloads:
+            st.error(qr.error or "No QR payload decoded.")
+            return
+        st.success(f"Decoded {len(qr.payloads)} QR payload(s).")
+        for value in qr.payloads:
+            st.code(value, language="text")
+    _render_url_verdicts("\n".join(qr.payloads))
+
+
+_DEEPFAKE_SUSPICION_COLOR: Dict[str, str] = {
+    "Low": "#1E7E34", "Elevated": "#E0A800", "High": "#C0392B",
+    "Inconclusive": "#4B5C6B",
+}
+
+
+def _osint_deepfake_block(payload: bytes, filename: str) -> str:
+    """Render the dual-layer deepfake workflow (ELA + Hugging Face). Returns summary."""
+    st.markdown("**🧪 Layer 1 — Error Level Analysis (deterministic, local)**")
+    ela = osint_sandbox.error_level_analysis(payload)
+    summary_parts: List[str] = []
+    if not ela.available:
+        st.warning(ela.note)
+    else:
+        color: str = _DEEPFAKE_SUSPICION_COLOR.get(ela.suspicion, "#7FA8C9")
+        ela_col, orig_col = st.columns(2)
+        with orig_col:
+            st.image(payload, caption="Original", use_container_width=True)
+        with ela_col:
+            st.image(ela.ela_png, caption="ELA (autoscaled residue)",
+                     use_container_width=True)
+        st.markdown(
+            f"<span class='cs-sev' style='background:{color}'>"
+            f"ELA: {ela.suspicion.upper()}</span> &nbsp;"
+            f"<span style='color:#7FA8C9;font-size:0.78rem'>max diff "
+            f"{ela.max_diff} · mean {ela.mean_diff}</span>", unsafe_allow_html=True)
+        for flag in ela.flags:
+            st.markdown(f"- {flag}")
+        summary_parts.append(f"ELA suspicion={ela.suspicion} (max {ela.max_diff}, "
+                             f"mean {ela.mean_diff})")
+
+    st.markdown("**🤗 Layer 2 — Hugging Face deepfake classifier (remote model)**")
+    verdict = osint_sandbox.huggingface_deepfake_detect(payload)
+    if verdict.source == "hf-live":
+        st.success(verdict.note)
+        st.dataframe(
+            pd.DataFrame([{"label": s["label"], "score": round(float(s["score"]), 4)}
+                          for s in verdict.scores]),
+            use_container_width=True, hide_index=True)
+        summary_parts.append(f"HF[{verdict.model}] top={verdict.top_label} "
+                             f"@ {verdict.top_score:.2f}")
+    elif verdict.source == "loading":
+        st.info(verdict.note)
+    elif verdict.source == "no-token":
+        st.info(verdict.note)
+    else:
+        st.warning(verdict.note)
+    st.caption(f"Model: `{verdict.model}`")
+    return "; ".join(summary_parts)
+
+
+def _osint_deepfake_tool() -> None:
+    """Toolbed 5 — deepfake verification (ELA + HF) + container integrity + breaches."""
+    st.markdown("##### 🪞 Deepfake Verification & Forensic Imaging")
+    st.caption(
+        "A dual-layer authenticity workflow: a deterministic local **Error Level "
+        "Analysis** pass that surfaces splice/face-swap recompression edges, plus "
+        "an optional **Hugging Face** deepfake classifier. ELA is an indicator, "
+        "not proof — corroborate before concluding.")
+    uploaded = st.file_uploader("Upload image to verify", type=["jpg", "jpeg", "png", "webp"],
+                                key="osint_deepfake_file")
+    if uploaded is not None:
+        payload: bytes = uploaded.getvalue()
+        _osint_custody(uploaded.name, payload)
+        summary: str = _osint_deepfake_block(payload, uploaded.name)
+        if summary:
+            _osint_officer("Deepfake Verification", summary, "osint_deepfake_ai")
+
+    st.divider()
+    st.markdown("##### 🔍 Container integrity (magic-byte & EOF check)")
+    st.caption(
+        "Structural sanity check on any media container: magic-byte type vs. file "
+        "extension, EOF-marker integrity and bytes appended past EOF (a "
+        "steganography / polyglot / re-mux tell).")
+    media_up = st.file_uploader(
+        "Upload media file",
+        type=["jpg", "jpeg", "png", "gif", "webp", "bmp", "mp4", "mov", "mp3", "pdf"],
+        key="osint_media_file")
+    if media_up is not None:
+        payload = media_up.getvalue()
+        _osint_custody(media_up.name, payload)
+        report = osint_sandbox.inspect_media(payload, media_up.name)
+        color = _OSINT_RISK_COLOR.get(report.severity, "#7FA8C9")
+        st.markdown(
+            f"<span class='cs-sev' style='background:{color}'>"
+            f"{report.severity.upper()}</span> &nbsp;<b>{report.detected_type}</b> "
+            f"&nbsp;<span style='color:#7FA8C9;font-size:0.74rem'>· {report.mime}</span>",
+            unsafe_allow_html=True)
+        cols: List[object] = st.columns(4)
+        cols[0].metric("Declared ext", report.declared_ext)
+        cols[1].metric("Ext matches", "✅" if report.extension_match else "❌")
+        cols[2].metric("EOF intact", "✅" if report.eof_intact else "❌")
+        cols[3].metric("Trailing bytes", f"{report.trailing_bytes:,}")
+        st.markdown("**🚩 Structural findings:**")
+        for flag in report.structural_flags:
+            st.markdown(f"- {flag}")
+
+    st.divider()
+    st.markdown("##### 🛡️ HaveIBeenPwned breach checker")
+    hibp_key = osint_sandbox.get_hibp_api_key()
+    st.caption("LIVE — HIBP_API_KEY configured." if hibp_key else
+               "OFFLINE MOCK — no HIBP_API_KEY set; results are sample data only.")
+    account: str = st.text_input("Email address", key="osint_hibp_account",
+                                 placeholder="name@example.com")
+    if st.button("🔎 Check breaches", key="osint_hibp_run",
+                 use_container_width=True) and account.strip():
+        with st.spinner("Querying breach datasets…"):
+            breach = osint_sandbox.hibp_check(account)
+        if breach.warning:
+            st.warning(breach.warning)
+        if breach.source == "error":
+            st.error(breach.note)
+        elif breach.breached:
+            st.error(breach.note)
+            st.dataframe(
+                pd.DataFrame(breach.breaches), use_container_width=True,
+                hide_index=True)
+        else:
+            st.success(breach.note)
+
+
+def render_osint_tab() -> None:
+    """Feature 3 — Integrated OSINT Sandbox (6 deterministic toolbeds)."""
+    st.markdown("#### 🕵️ Integrated OSINT Sandbox")
+    st.caption(
+        "A unified investigator workbench of deterministic, native-Python "
+        "forensic processors — email-header routing (raw or Base64), WHOIS, "
+        "EXIF/GPS with live mapping, URL/QR reputation with OpenCV decoding, and "
+        "deepfake/ELA imaging. Parsing is reproducible and court-defensible; the "
+        "optional AI layer only adds an operational-risk read on top. Every "
+        "uploaded artifact is SHA-256 logged for chain-of-custody. For "
+        "authorized investigators on lawfully-held data.")
+    tabs = st.tabs([
+        "✉️ Email Headers", "🌐 Domain WHOIS", "📷 Image EXIF",
+        "🔗 URL/QR Risk", "🪞 Deepfake & Integrity",
+    ])
+    with tabs[0]:
+        _osint_email_tool()
+    with tabs[1]:
+        _osint_whois_tool()
+    with tabs[2]:
+        _osint_exif_tool()
+    with tabs[3]:
+        _osint_url_tool()
+    with tabs[4]:
+        _osint_deepfake_tool()
+
+
+# --------------------------------------------------------------------------- #
+# Feature 4 — Case-Building & Practice Lab.                                   #
+# --------------------------------------------------------------------------- #
+
+def _lab_battery() -> "practice_lab.LabBattery":
+    """Resolve the active case battery once per session (remote → baseline)."""
+    battery = st.session_state.get("lab_battery")
+    if not isinstance(battery, practice_lab.LabBattery):
+        with st.spinner("Syncing the quarterly case matrix…"):
+            battery = practice_lab.CaseSyncManager().load()
+        st.session_state["lab_battery"] = battery
+    return battery
+
+
+def _lab_solved_ids() -> set:
+    """Return the per-session set of solved case ids (created once)."""
+    solved = st.session_state.get("lab_solved_ids")
+    if not isinstance(solved, set):
+        solved = set()
+        st.session_state["lab_solved_ids"] = solved
+    return solved
+
+
+def _parse_csv_block(raw: str) -> Optional[pd.DataFrame]:
+    """Parse a CSV-ish telemetry block into a DataFrame, ignoring NOTE lines."""
+    rows: List[str] = [ln for ln in raw.splitlines()
+                       if ln.strip() and not ln.strip().upper().startswith("NOTE")]
+    if len(rows) < 2:
+        return None
+    try:
+        return pd.read_csv(io.StringIO("\n".join(rows)))
+    except (ValueError, pd.errors.ParserError):
+        return None
+
+
+# ----- Embedded forensic toolbed (one self-contained widget per tool type). -- #
+
+
+def _lab_tool_email_decoder(case: "practice_lab.LabCase") -> None:
+    """EMAIL_DECODER: inline Base64 + RFC 2047 decoder."""
+    st.caption("Paste a Base64 blob or any MIME encoded-word (=?utf-8?B?…?=) "
+               "from the telemetry; it is decoded instantly, in-tab.")
+    blob: str = st.text_area("Base64 / encoded input", height=90,
+                             key=f"lab_emaildec_{case.case_id}",
+                             placeholder="=?utf-8?B?…?=  or a Base64 EML string")
+    if st.button("🧬 Decode", key=f"lab_emailbtn_{case.case_id}",
+                 use_container_width=True) and blob.strip():
+        result = practice_lab.decode_email_blob(blob)
+        if result["was_base64"]:
+            st.success("Base64 detected and decoded to UTF-8.")
+        st.code(str(result["decoded_text"]), language="text")
+        words = result["encoded_words"]
+        if words:
+            st.markdown("**Decoded MIME encoded-words:**")
+            st.dataframe(pd.DataFrame(words, columns=["Encoded", "Decoded"]),
+                         use_container_width=True, hide_index=True)
+
+
+def _lab_tool_cdr_filter(case: "practice_lab.LabCase") -> None:
+    """CDR_FILTER: micro query/value-counts over the record stream."""
+    st.caption("Filter the record stream: pick a column and run value-counts or a "
+               "substring query. Defaults to this case's telemetry; upload your "
+               "own CSV stream to override.")
+    upload = st.file_uploader("Optional: upload a CSV stream", type=["csv"],
+                              key=f"lab_cdrfile_{case.case_id}")
+    raw: str = (upload.getvalue().decode("utf-8", "ignore") if upload
+                else case.telemetry_dump)
+    frame = _parse_csv_block(raw)
+    if frame is None or frame.empty:
+        st.info("No tabular rows could be parsed from this stream.")
+        return
+    st.dataframe(frame, use_container_width=True, hide_index=True)
+    column: str = st.selectbox("Column", list(frame.columns),
+                               key=f"lab_cdrcol_{case.case_id}")
+    mode: str = st.radio("Operation", ["Value counts", "Substring filter"],
+                         horizontal=True, key=f"lab_cdrmode_{case.case_id}")
+    if mode == "Value counts":
+        counts = frame[column].astype(str).value_counts().reset_index()
+        counts.columns = [column, "count"]
+        st.dataframe(counts, use_container_width=True, hide_index=True)
+    else:
+        query: str = st.text_input("Rows where the column contains",
+                                   key=f"lab_cdrq_{case.case_id}")
+        if query:
+            mask = frame[column].astype(str).str.contains(query, case=False, na=False)
+            st.dataframe(frame[mask], use_container_width=True, hide_index=True)
+
+
+def _lab_tool_geolocation_plotter(case: "practice_lab.LabCase") -> None:
+    """GEOLOCATION_PLOTTER: DMS → decimal conversion plus a live st.map()."""
+    st.caption("Enter the Degrees / Minutes / Seconds from the telemetry GPS "
+               "block; convert to decimal degrees and plot the capture point.")
+    lat_c: List[object] = st.columns(4)
+    lat_d = lat_c[0].number_input("Lat °", value=0.0, key=f"lab_latd_{case.case_id}")
+    lat_m = lat_c[1].number_input("Lat ′", value=0.0, key=f"lab_latm_{case.case_id}")
+    lat_s = lat_c[2].number_input("Lat ″", value=0.0, key=f"lab_lats_{case.case_id}")
+    lat_r = lat_c[3].selectbox("Ref", ["N", "S"], key=f"lab_latr_{case.case_id}")
+    lon_c: List[object] = st.columns(4)
+    lon_d = lon_c[0].number_input("Lon °", value=0.0, key=f"lab_lond_{case.case_id}")
+    lon_m = lon_c[1].number_input("Lon ′", value=0.0, key=f"lab_lonm_{case.case_id}")
+    lon_s = lon_c[2].number_input("Lon ″", value=0.0, key=f"lab_lons_{case.case_id}")
+    lon_r = lon_c[3].selectbox("Ref", ["E", "W"], key=f"lab_lonr_{case.case_id}")
+    if st.button("🗺️ Convert & plot", key=f"lab_geobtn_{case.case_id}",
+                 use_container_width=True):
+        lat: float = practice_lab.dms_to_decimal(lat_d, lat_m, lat_s, lat_r)
+        lon: float = practice_lab.dms_to_decimal(lon_d, lon_m, lon_s, lon_r)
+        cols: List[object] = st.columns(2)
+        cols[0].metric("Latitude (decimal)", f"{lat:g}")
+        cols[1].metric("Longitude (decimal)", f"{lon:g}")
+        st.map(pd.DataFrame({"lat": [lat], "lon": [lon]}), zoom=11,
+               use_container_width=True)
+
+
+def _lab_tool_string_sanitizer(case: "practice_lab.LabCase") -> None:
+    """STRING_SANITIZER: IOC extraction + a canonical-flag preview."""
+    st.caption("Paste raw log text to extract indicators (IPs, URLs, domains, "
+               "emails/VPAs, hashes, wallets). The preview shows how a value will "
+               "be normalised before evaluation.")
+    text: str = st.text_area("Raw text to parse", height=110,
+                             key=f"lab_strtext_{case.case_id}",
+                             value=case.telemetry_dump)
+    if st.button("🔎 Extract indicators", key=f"lab_strbtn_{case.case_id}",
+                 use_container_width=True) and text.strip():
+        indicators = practice_lab.extract_indicators(text)
+        if not indicators:
+            st.info("No recognisable indicators found.")
+        for label, items in indicators.items():
+            st.markdown(f"**{label}:**")
+            st.code("\n".join(items), language="text")
+    preview: str = st.text_input("Canonical-flag preview",
+                                 key=f"lab_strprev_{case.case_id}",
+                                 placeholder="paste a value to see its sanitised form")
+    if preview:
+        st.markdown(f"Normalised → `{practice_lab.sanitize_flag_input(preview)}`")
+
+
+_LAB_TOOL_DISPATCH = {
+    "EMAIL_DECODER": _lab_tool_email_decoder,
+    "CDR_FILTER": _lab_tool_cdr_filter,
+    "GEOLOCATION_PLOTTER": _lab_tool_geolocation_plotter,
+    "STRING_SANITIZER": _lab_tool_string_sanitizer,
+}
+
+_LAB_TOOL_TITLE = {
+    "EMAIL_DECODER": "✉️ Embedded Email Decoder",
+    "CDR_FILTER": "📞 Embedded CDR / Ledger Filter",
+    "GEOLOCATION_PLOTTER": "🗺️ Embedded Geolocation Plotter",
+    "STRING_SANITIZER": "🧷 Embedded String Sanitizer",
+}
+
+
+def _lab_render_notice_console(case: "practice_lab.LabCase") -> None:
+    """Unlocked-on-solve Section 94 BNSS generation dashboard."""
+    st.success("✅ Evidence verified — Section 94 BNSS legal console unlocked.")
+    st.markdown("##### ⚖️ Section 94 BNSS Production-Notice Console")
+    notes: str = st.text_area(
+        "Investigating Officer's notes (optional)",
+        key=f"lab_notes_{case.case_id}", height=90,
+        placeholder="Add any narrative findings to embed in the WHEREAS recital…")
+    meta: List[object] = st.columns(3)
+    officer: str = meta[0].text_input("Officer name & rank",
+                                      key=f"lab_off_{case.case_id}")
+    station: str = meta[1].text_input("Cyber Crime Police Station",
+                                      key=f"lab_ps_{case.case_id}")
+    fir: str = meta[2].text_input("FIR / Case No.", key=f"lab_fir_{case.case_id}")
+    if st.button("⚖️ Generate Section 94 BNSS Notice", type="primary",
+                 key=f"lab_notice_{case.case_id}", use_container_width=True):
+        verified: Dict[str, str] = dict(case.validation_matrix)
+        with st.spinner("Drafting Section 94 BNSS production notice…"):
+            notice, source = practice_lab.generate_section94_notice(
+                case, verified, notes, officer_name=officer,
+                police_station=station, fir_number=fir)
+        st.session_state[f"lab_notice_out_{case.case_id}"] = (notice, source)
+
+    cached = st.session_state.get(f"lab_notice_out_{case.case_id}")
+    if isinstance(cached, tuple):
+        notice, source = cached
+        provenance: str = ("AI cascade" if source == "ai-cascade"
+                           else "Deterministic statutory engine (AI at capacity)")
+        st.caption(f"Drafted by: {provenance}")
+        st.code(notice, language="text")
+        st.download_button(
+            "⬇️ Download notice (.txt)", data=notice,
+            file_name=f"section94_bnss_{case.case_id}.txt", mime="text/plain",
+            key=f"lab_dl_{case.case_id}", use_container_width=True)
+
+
+def _lab_render_workspace(case: "practice_lab.LabCase") -> None:
+    """Split mission-control viewport: evidence desk (3) + eval terminal (2)."""
+    solved_ids: set = _lab_solved_ids()
+    cleared: bool = case.case_id in solved_ids
+    status: str = ("<span class='cs-card-tag'>CLEARED</span>" if cleared
+                   else "<span class='cs-card-tag soon'>OPEN</span>")
+    st.markdown(
+        f"#### 🗂️ {case.title} &nbsp;<code>{case.case_id}</code> &nbsp;{status}",
+        unsafe_allow_html=True)
+    st.caption(f"Tier: {case.level} · Target entity: {case.target_entity}")
+
+    desk, terminal = st.columns([3, 2])
+
+    # ----------------- Left: Evidence & Analysis Desk (60%) ------------------ #
+    with desk:
+        st.markdown("##### 📋 Case dossier")
+        st.markdown(f"<div class='cs-briefing'>{case.briefing}</div>",
+                    unsafe_allow_html=True)
+        st.markdown(f"<div class='cs-legal'><b>Statutory framework.</b> "
+                    f"{case.statutory_context}</div>", unsafe_allow_html=True)
+
+        st.markdown("##### 🧾 Raw telemetry on record")
+        st.code(case.telemetry_dump, language="text")
+
+        st.markdown("##### 📥 Download terminal")
+        st.caption(f"Source artifact: `{case.download_url}`")
+        st.download_button(
+            f"⬇️ Download raw artifact — {case.artifact_filename}",
+            data=case.telemetry_dump, file_name=case.artifact_filename,
+            mime="text/plain", key=f"lab_artifact_{case.case_id}",
+            use_container_width=True)
+
+        st.divider()
+        tool_type: str = case.embedded_tool_type
+        st.markdown(f"##### 🛠️ {_LAB_TOOL_TITLE.get(tool_type, 'Embedded tool')}")
+        renderer = _LAB_TOOL_DISPATCH.get(tool_type)
+        if renderer is None:
+            st.info("No embedded tool is configured for this case.")
+        else:
+            renderer(case)
+
+    # --------------- Right: Interactive Evaluation Terminal (40%) ------------ #
+    with terminal:
+        st.markdown("##### 🎛️ Forensic flag matrix")
+        st.caption("Submit every required ground-truth flag. Evaluation is a "
+                   "strict logical AND — all flags must match exactly.")
+        inputs: Dict[str, str] = {}
+        for key in case.validation_matrix:
+            inputs[key] = st.text_input(
+                case.flag_label(key), key=f"lab_flag_{case.case_id}_{key}")
+
+        if st.button("🔬 Verify Evidence", type="primary",
+                     key=f"lab_verify_{case.case_id}", use_container_width=True):
+            passed, results = practice_lab.validate_matrix(case, inputs)
+            st.session_state[f"lab_results_{case.case_id}"] = results
+            if passed:
+                solved_ids.add(case.case_id)
+                st.session_state["lab_solved_ids"] = solved_ids
+                LOGGER.info("lab case cleared: %s", case.case_id)
+                st.balloons()
+            else:
+                st.error("One or more flags are incorrect — re-examine the "
+                         "telemetry with the embedded tool and resubmit.")
+
+        results = st.session_state.get(f"lab_results_{case.case_id}")
+        if isinstance(results, dict) and results:
+            for key, ok in results.items():
+                st.markdown(f"- {'✅' if ok else '❌'} {case.flag_label(key)}")
+
+        if case.case_id in solved_ids:
+            st.divider()
+            _lab_render_notice_console(case)
+
+
+def render_lab_tab() -> None:
+    """Feature 4 — Case-Building & Practice Lab (self-contained, split viewport)."""
+    battery = _lab_battery()
+    solved_ids: set = _lab_solved_ids()
+    st.markdown("#### 🎓 Case-Building & Practice Lab")
+    st.caption(
+        "A self-contained forensic training ecosystem. Each case ships an "
+        "exhaustive dossier, a downloadable raw artifact, an embedded analysis "
+        "tool, and a multi-flag ground-truth matrix — solve it entirely in this "
+        "tab, then issue a statutory **Section 94 BNSS, 2023** production notice. "
+        "Progress is held only in your browser session.")
+
+    if battery.is_baseline:
+        st.warning(f"📦 Running on Local Baseline Data (quarterly cycle "
+                   f"{battery.cycle}) — the remote case mirror was unreachable.")
+    else:
+        st.success(f"🛰️ Synced remote case matrix — quarterly cycle {battery.cycle}.")
+
+    cleared_count: int = sum(1 for c in battery.cases if c.case_id in solved_ids)
+    total: int = len(battery.cases)
+    dash: List[object] = st.columns(4)
+    dash[0].metric("Current rank", practice_lab.rank_title(cleared_count))
+    dash[1].metric("Cases cleared", f"{cleared_count} / {total}")
+    dash[2].metric("Active cycle", battery.cycle)
+    dash[3].progress(cleared_count / total if total else 0.0, text="Matrix progress")
+
+    chosen_level: str = st.radio("Difficulty tier", list(practice_lab.LEVELS),
+                                 horizontal=True, key="lab_level_radio")
+    tier_cases = practice_lab.cases_for_level(battery, chosen_level)
+    if not tier_cases:
+        st.info("No cases in this tier for the active cycle.")
+        return
+    case_labels: List[str] = [
+        f"{'✅ ' if c.case_id in solved_ids else ''}{c.title}" for c in tier_cases]
+    picked: str = st.radio("Select a case file", case_labels,
+                           key=f"lab_case_{chosen_level}")
+    active_case = tier_cases[case_labels.index(picked)]
+
+    st.divider()
+    _lab_render_workspace(active_case)
+
+
 def render_coming_soon(view_key: str) -> None:
     """Honest staging panel for modules landing in the next build phase."""
     meta = next((f for f in NAV_FEATURES if f[0] == view_key), None)
@@ -1588,9 +2333,9 @@ def render_coming_soon(view_key: str) -> None:
     st.markdown(f"#### {icon} {title}")
     st.caption(blurb)
     st.info(
-        "This module is being implemented in the next build phase of the grid. "
-        "The home overview, Victim Triage and the CDR/IPDR Analyzer are live "
-        "now; the OSINT sandbox and the Practice Lab follow in sequence."
+        "All six grid modules — Macro Trends, the Semantic Explorer, Victim "
+        "Triage, the CDR/IPDR Analyzer, the OSINT Sandbox and the Case-Building "
+        "Practice Lab — are live. Select one from the navigation bar above."
     )
 
 
@@ -1641,7 +2386,11 @@ def main() -> None:
         render_triage_tab()
     elif view == "cdr":
         render_cdr_tab()
-    else:  # osint / lab — staged for the next build phase
+    elif view == "osint":
+        render_osint_tab()
+    elif view == "lab":
+        render_lab_tab()
+    else:  # unknown view key — honest staging panel
         render_coming_soon(view)
     LOGGER.info("Frame rendered (view=%s, corpus=%d, pure_operational=%s)",
                 view, corpus, exclude_demo)

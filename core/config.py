@@ -94,3 +94,22 @@ def get_custom_search_key() -> Optional[str]:
 def get_search_engine_id() -> Optional[str]:
     """Return the Google Programmable Search engine (cx) id, or None."""
     return _get_optional("GOOGLE_SEARCH_ENGINE_ID")
+
+
+def get_hibp_api_key() -> Optional[str]:
+    """Return the HaveIBeenPwned v3 API key for breach checks, or None.
+
+    When absent, the OSINT sandbox falls back to a clearly-labelled offline
+    mock dataset rather than calling the paid HIBP endpoint.
+    """
+    return _get_optional("HIBP_API_KEY")
+
+
+def get_hf_api_token() -> Optional[str]:
+    """Return the Hugging Face Inference API token for the deepfake model, or None.
+
+    Accepts either ``HF_API_TOKEN`` or the conventional ``HUGGINGFACEHUB_API_TOKEN``.
+    When absent, the OSINT deepfake tool runs the deterministic ELA layer only and
+    surfaces an honest 'token not configured' diagnostic for the remote layer.
+    """
+    return _get_optional("HF_API_TOKEN") or _get_optional("HUGGINGFACEHUB_API_TOKEN")
