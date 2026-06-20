@@ -40,6 +40,15 @@ Pillow>=10.0.0
 # Provides the `serpapi` module; set SERPAPI_API_KEY in .env.
 google-search-results>=2.4.2
 
+# --- OSINT Sandbox (Feature 3): WHOIS enrichment ---
+# Optional. The sandbox degrades to a native socket (port 43) WHOIS query when
+# this library (or a system `whois` binary) is absent, so it is not a hard dep.
+python-whois>=0.9.4
+
+# --- OSINT Sandbox (Feature 3): QR-code computer-vision decoding ---
+# Headless build (no GUI/X11 libs) for cv2.QRCodeDetector. numpy ships with it.
+opencv-python-headless>=4.10.0
+
 # --- Autonomous background scheduling ---
 apscheduler>=3.11.0
 
