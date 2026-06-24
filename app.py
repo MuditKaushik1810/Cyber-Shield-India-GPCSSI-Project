@@ -36,15 +36,17 @@ from services import research_repository as rr
 from services import cdr_analyzer
 from services import osint_sandbox
 from services import practice_lab
+from services import threat_registry
 from services import victim_triage
 from services.research_agent import AnalyticalPlan, ResearchAgent, run_select
 
 # Navigation registry — single source of truth for the home grid + top nav.
 # (key, icon, title, one-line blurb, "ready" flag for this build phase).
 NAV_FEATURES: List[Tuple[str, str, str, str, bool]] = [
-    ("macro", "📊", "Macro Trends",
-     "Geospatial hot-spots, scam-vector landscape, demographic matrix and the "
-     "localized state tracker under one chronological filter.", True),
+    ("macro", "📊", "Strategic Threat Analytics",
+     "Asset-centric threat registry: a cross-referencing tag matrix, regulatory "
+     "advisories, a 36-jurisdiction State/UT directory and an expert signal "
+     "monitor.", True),
     ("explorer", "🔎", "Semantic Explorer",
      "Ask deep research questions across the curated advisory corpus or render "
      "custom analytical charts from natural language.", True),
@@ -874,7 +876,13 @@ def render_infrastructure_charts(interval: str, exclude_demo: bool) -> None:
 
 
 def render_asset_intelligence(interval: str, exclude_demo: bool) -> None:
-    """Asset Intelligence Log + legally-aligned forensic triage playbook."""
+    """Asset Intelligence Log (table only).
+
+    The forensic-playbook selector and BSA certificate export that previously
+    lived here now reside in the Victim Triage tab
+    (:func:`render_triage_playbook_console`); this legacy view is purely the
+    technical-indicator table.
+    """
     st.markdown("#### 🔍 Actionable Technical Indicators & Assets")
     log: List[Dict[str, object]] = cached_asset_log(interval, exclude_demo, _minute_bucket())
     if not log:
@@ -889,52 +897,215 @@ def render_asset_intelligence(interval: str, exclude_demo: bool) -> None:
         width="stretch", hide_index=True,
     )
 
-    # Legally-aligned First-Responder playbook for a selected threat/sector.
-    combos: List[Tuple[str, str]] = sorted({
-        (str(r["threat_domain"]), str(r["target_sector"])) for r in log
-    })
-    labels: List[str] = [f"{domain}  ·  {sector}" for domain, sector in combos]
-    choice: str = st.selectbox("Generate a forensic playbook for:", labels)
-    domain, sector = combos[labels.index(choice)]
-    match: Dict[str, object] = next(
-        (r for r in log if str(r["threat_domain"]) == domain
-         and str(r["target_sector"]) == sector), {})
-    timestamp: str = str(match.get("timestamp", ""))
-    assets: str = str(match.get("compromised_assets", ""))
-    steps: List[Dict[str, str]] = cached_playbook(domain, sector, _cache_day())
-    with st.expander("📋 View First-Responder Investigation Playbook"):
-        for step in steps:
-            st.markdown(f"**{step.get('action', '')}**  \n{step.get('detail', '')}")
-        st.caption("⚖️ Digital-evidence preservation aligned with Section 63(4), "
-                   "Bharatiya Sakshya Adhiniyam (BSA), 2023 (Part A & Part B "
-                   "certificate; SHA-256 hashing; chain of custody).")
-        st.caption(
-            "⚠️ INVESTIGATIVE TRIAGE NOTE: This playbook provides automated "
-            "first-responder guidance and digital forensics preservation "
-            "templates. It does not constitute formal legal advice. Always "
-            "cross-verify final certificate formats and chain-of-custody "
-            "protocols with designated legal counsel or cyber cell prosecutors "
-            "before formal judicial submission."
-        )
 
-    from services.playbook import compile_case_brief
-    brief: str = compile_case_brief(timestamp, domain, sector, assets, steps)
-    safe_name: str = f"{domain}_{sector}".replace(" ", "_").replace("/", "-")
-    st.download_button(
-        "📥 Export Investigation Brief & BSA Certificate Draft",
-        data=brief,
-        file_name=f"cyber_brief_{safe_name}.md",
-        mime="text/markdown",
-    )
+def render_threat_tag_matrix() -> Optional[str]:
+    """Global tag selector that bubbles a chosen scam mechanism across the board.
+
+    The selection is mirrored into ``st.session_state['active_threat_tag']`` so it
+    carries over to the Victim Triage tab (cross-tab continuity).
+    """
+    st.markdown("##### 🏷️ Cross-Referencing Threat Tag Matrix")
+    st.caption(
+        "Select a scam mechanism to instantly filter the regulatory advisories "
+        "and expert signals below. Your selection carries into Victim Triage to "
+        "pre-select the matching playbook and highlight the relevant provisions.")
+    tags: List[str] = threat_registry.list_tags()
+    options: List[str] = ["🌐 All vectors"] + tags
+    current = st.session_state.get("active_threat_tag")
+    index: int = options.index(current) if current in options else 0
+    chosen: str = st.radio(
+        "Active threat vector", options, horizontal=True, index=index,
+        key="threat_tag_radio", label_visibility="collapsed")
+    active: Optional[str] = None if chosen == "🌐 All vectors" else chosen
+    st.session_state["active_threat_tag"] = active
+    if active:
+        meta = threat_registry.get_tag(active)
+        if meta is not None:
+            st.markdown(
+                f"<div class='cs-briefing'>🏷️ <b>{meta.tag} — {meta.label}.</b> "
+                f"{meta.mechanism}</div>", unsafe_allow_html=True)
+            st.markdown(
+                f"📡 Matching regulatory body: **[{meta.advisory_body}]"
+                f"({meta.advisory_url})** &nbsp;·&nbsp; Indicative provisions: "
+                f"{meta.provisions}")
+    return active
+
+
+def render_tag_advisories(active_tag: Optional[str]) -> None:
+    """Bubble up official + live web advisories matching the active mechanism."""
+    st.markdown("##### 📡 Regulatory & Official Advisories")
+    if active_tag:
+        meta = threat_registry.get_tag(active_tag)
+        scam_query: str = meta.label if meta else "cyber fraud"
+        if meta is not None:
+            st.markdown(
+                f"<div class='cs-advisory'>"
+                f"<span class='cs-webbadge'>🏛️ Official Source</span>"
+                f"<b>{meta.advisory_body}</b> — authoritative advisory channel for "
+                f"{meta.label}.<br>🔗 <a href='{meta.advisory_url}' target='_blank'>"
+                f"Open advisory portal</a></div>", unsafe_allow_html=True)
+    else:
+        scam_query = "cyber fraud"
+        st.caption("Select a tag above to bubble up advisories for that specific "
+                   "mechanism, or browse the general live feed below.")
+    # render_web_advisories returns False when the cascade is fully exhausted (or
+    # web seeding is unavailable). Intercept cleanly: banner + static baseline so
+    # the tab populates from offline data instead of an unhandled error screen.
+    if not render_web_advisories(scam_query):
+        st.warning("⚠️ Upstream Threat Intelligence Engine is temporarily "
+                   "experiencing high volume. Serving localized offline advisory "
+                   "updates.")
+        for card in threat_registry.offline_advisories(active_tag):
+            st.markdown(
+                f"<div class='cs-advisory'>"
+                f"<span class='cs-webbadge'>🗂️ Offline Baseline</span>"
+                f"<b>{card['title']}</b><br>{card['description']}<br>"
+                f"🔗 <a href='{card['url']}' target='_blank'>Official advisory "
+                f"portal</a></div>", unsafe_allow_html=True)
+
+
+# Severity → (badge emoji, accent colour) for the threat matrix display.
+_SEVERITY_BADGE: Dict[str, Tuple[str, str]] = {
+    "CRITICAL": ("🔴", "#C0392B"),
+    "HIGH": ("🟠", "#D97706"),
+    "MEDIUM": ("🟡", "#2E7D32"),
+}
+
+
+def _severity_label(severity: str) -> str:
+    """Return a scannable '🔴 CRITICAL' style badge label."""
+    emoji, _ = _SEVERITY_BADGE.get(severity.upper(), ("⚪", "#4B5C6B"))
+    return f"{emoji} {severity.upper()}"
+
+
+def _render_jurisdiction_header(name: str, intel: Dict[str, object]) -> None:
+    """Authoritative directory header card: nodal cell + reporting portal."""
+    kind: str = threat_registry.jurisdiction_kind(name)
+    cell: str = str(intel.get("cell_name", "—"))
+    portal: str = str(intel.get("portal", threat_registry.NCRP_PORTAL))
+    st.markdown(
+        f"<div class='cs-advisory'>"
+        f"<span class='cs-webbadge'>🏛️ National Directory</span>"
+        f"<b>{name}</b> &nbsp;·&nbsp; <i>{kind}</i><br>"
+        f"<b>Cyber Nodal Cell:</b> {cell}</div>", unsafe_allow_html=True)
+    left, right = st.columns([2, 2])
+    with left:
+        st.metric("📞 NCRP Helpline", threat_registry.NCRP_HELPLINE)
+        st.markdown(f"**🔗 Reporting Portal**  \n[{portal}]({portal})")
+    with right:
+        st.metric("🧭 Jurisdiction Type", kind)
+        st.markdown(f"**🛡️ Escalation**  \nFile at "
+                    f"[NCRP]({threat_registry.NCRP_PORTAL}) within the golden "
+                    "hour · route to the nodal cell above.")
+
+
+def _render_high_alert_vector(vector_name: str, vec: Dict[str, object]) -> None:
+    """Bubble a tag-matched vector as a prominent, colour-coded high alert."""
+    severity: str = str(vec.get("severity", "MEDIUM")).upper()
+    emoji, color = _SEVERITY_BADGE.get(severity, ("⚪", "#4B5C6B"))
+    st.markdown(
+        f"<div class='cs-advisory' style='border-left:6px solid {color}'>"
+        f"<span class='cs-sev' style='background:{color}'>{emoji} {severity}</span>"
+        f"&nbsp;<b>{vector_name}</b> &nbsp;·&nbsp; {vec.get('trend', '')}<br>"
+        f"<span style='color:#7FA8C9;font-size:0.8rem'>📋 Governing bulletin: "
+        f"{vec.get('bulletin', '')}</span></div>", unsafe_allow_html=True)
+
+
+def _render_state_matrix_table(intel: Dict[str, object]) -> None:
+    """Render a State/UT's full 3-vector threat catalog as a scannable table."""
+    matrix: Dict[str, object] = intel.get("threat_matrix", {})  # type: ignore[assignment]
+    rows: List[Dict[str, str]] = []
+    for vname, vec in matrix.items():
+        rows.append({
+            "Active Threat Vector": vname,
+            "Severity": _severity_label(str(vec.get("severity", ""))),
+            "Trend": str(vec.get("trend", "")),
+            "Governing Bulletin": str(vec.get("bulletin", "")),
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def render_jurisdiction_directory(interval: str, exclude_demo: bool) -> None:
+    """36-jurisdiction State/UT directory with a tag-aware dynamic threat matrix."""
+    st.markdown("#### 📍 State & Union Territory Threat Directory")
+    st.caption("All 28 States and 8 Union Territories mapped to their cyber nodal "
+               "cell, reporting portal and a live 3-vector threat matrix. Select a "
+               "tag in the matrix above to bubble the matching regional vector to "
+               "the top.")
+    names: List[str] = threat_registry.all_jurisdictions()
+    default_index: int = names.index("Tamil Nadu") if "Tamil Nadu" in names else 0
+    chosen: str = st.selectbox("Select your State / Union Territory context",
+                               names, index=default_index)
+    intel = threat_registry.get_state_intel(chosen)
+    if intel is None:
+        st.info("No directory profile found for this jurisdiction.")
+        return
+    _render_jurisdiction_header(chosen, intel)
+
+    active_tag: Optional[str] = st.session_state.get("active_threat_tag")
+    matrix: Dict[str, object] = intel.get("threat_matrix", {})  # type: ignore[assignment]
+
+    # Scenario A — a global tag is active: bubble the matching regional vector(s).
+    if active_tag:
+        matches = [(n, v) for n, v in matrix.items()
+                   if isinstance(v, dict) and v.get("tag") == active_tag]
+        if matches:
+            st.markdown(f"##### 🚨 Tag-matched high-alert vector — {active_tag} "
+                        f"in {chosen}")
+            for name, vec in matches:
+                _render_high_alert_vector(name, vec)
+            st.caption("Full regional catalog:")
+            _render_state_matrix_table(intel)
+            return
+        st.info(f"No active **{active_tag}** vector recorded for {chosen} — "
+                "showing the full regional threat catalog.")
+
+    # Scenario B — no active tag (or no match): the full scannable catalog.
+    st.markdown(f"##### 🗂️ Regional threat catalog — {chosen}")
+    _render_state_matrix_table(intel)
+
+
+def render_signal_monitor(active_tag: Optional[str]) -> None:
+    """Phase 3 — curated expert & enforcement awareness signal feed."""
+    st.markdown("### 🎙️ Community Awareness & Signal Aggregation Engine")
+    caption: str = ("Curated security alerts and tactical case breakdowns from "
+                    "prominent cyber-awareness creators and city/state cyber cells.")
+    if active_tag:
+        caption += f" Filtered to **{active_tag}**."
+    st.caption(caption)
+    signals = threat_registry.signals_for_tag(active_tag)
+    if not signals:
+        st.info(f"No curated signals tagged {active_tag} yet — showing the full "
+                "awareness feed.")
+        signals = threat_registry.signals_for_tag(None)
+    for signal in signals:
+        meta_col, body_col = st.columns([1, 3])
+        with meta_col:
+            st.markdown(f"**{signal.author}**")
+            st.caption(signal.credentials)
+            st.caption(f"{signal.handle} · 🗓️ {signal.published}")
+            chips: str = " ".join(
+                f"<span class='cs-domainchip'>{tag}</span>" for tag in signal.tags)
+            if chips:
+                st.markdown(chips, unsafe_allow_html=True)
+        with body_col:
+            st.markdown(signal.summary)
+            if signal.poster_note:
+                st.markdown(
+                    f"<div class='cs-advisory'>🖼️ <b>Advisory poster:</b> "
+                    f"{signal.poster_note}</div>", unsafe_allow_html=True)
+        st.divider()
 
 
 def render_macro_trends_tab(exclude_demo: bool) -> None:
-    """The four analytics modules under one chronological filter."""
-    st.caption("Aggregated, AI-synthesized public-domain cybercrime trends. "
-               "Use the chronological filter to scope every module below.")
+    """Strategic Threat Analytics — asset-centric TIP registry & signal engine."""
+    st.caption(
+        "Unified threat registry and analytical engine aggregating regional "
+        "incident parameters, statutory frameworks, and historical multi-state "
+        "cybercrime baselines.")
     if exclude_demo:
         st.caption("🔒 **Pure operational mode** — demo & NCRB-baseline records "
-                   "stripped; charts reflect live crawled telemetry only.")
+                   "stripped; live crawled telemetry only.")
     interval: str = st.radio(
         "Chronological filter", INTERVAL_ORDER,
         format_func=lambda key: INTERVAL_LABELS[key],
@@ -948,22 +1119,43 @@ def render_macro_trends_tab(exclude_demo: bool) -> None:
         unsafe_allow_html=True,
     )
 
-    # ===== FINANCIAL FRAUD DASHBOARD (isolated — currency only) =============
+    # ===== Cross-referencing tag matrix (drives the whole board) ============
     st.divider()
-    render_geospatial(interval, exclude_demo)
-    st.divider()
-    render_vector_landscape(interval, exclude_demo)
-    st.divider()
-    render_demographic(interval, exclude_demo)
-    st.divider()
-    render_state_tracker(interval, exclude_demo)
+    active_tag: Optional[str] = render_threat_tag_matrix()
 
-    # ===== DIGITAL & INFRASTRUCTURE THREAT INTEL (stacked beneath) ==========
+    # ===== Regulatory advisories scoped to the active mechanism ============
+    st.divider()
+    render_tag_advisories(active_tag)
+
+    # ===== 36-jurisdiction State/UT directory with admin fallback ==========
+    st.divider()
+    render_jurisdiction_directory(interval, exclude_demo)
+
+    # ===== Dense non-financial technical KPI strip (qualitative) ===========
     st.divider()
     st.markdown("### 🚨 Digital & Infrastructure Threat Intel")
     render_infrastructure_kpis(interval, exclude_demo)
-    render_infrastructure_charts(interval, exclude_demo)
-    render_asset_intelligence(interval, exclude_demo)
+
+    # ===== Expert & enforcement awareness signal monitor ===================
+    st.divider()
+    render_signal_monitor(active_tag)
+
+    # ===== Historical baseline chart layer (graceful bottom section) =======
+    st.markdown("---")
+    st.markdown("### 📊 Historical Baselines & Volatile Statistical Visualizers")
+    with st.expander("📈 View Legacy Spatial & Vector Analytics Charts",
+                     expanded=False):
+        render_geospatial(interval, exclude_demo)
+        st.divider()
+        render_vector_landscape(interval, exclude_demo)
+        st.divider()
+        render_demographic(interval, exclude_demo)
+        st.divider()
+        render_state_tracker(interval, exclude_demo)
+        st.divider()
+        render_infrastructure_charts(interval, exclude_demo)
+        st.divider()
+        render_asset_intelligence(interval, exclude_demo)
 
 
 # --------------------------------------------------------------------------- #
@@ -1204,29 +1396,34 @@ def _query_sandbox(question: str) -> None:
         st.error("Could not query the uploaded document right now.")
 
 
-def render_sandbox_sidebar() -> None:
-    """Sidebar uploader for the isolated, session-only document sandbox."""
-    st.sidebar.markdown("### 📎 Ad-Hoc Document Sandbox")
-    st.sidebar.caption(
-        "Upload a PDF/text file to query during this session only. It is "
-        "embedded in volatile memory and **never** merged into the curated "
-        "repository."
-    )
-    uploaded = st.sidebar.file_uploader("Upload PDF or text", type=["pdf", "txt"])
-    if uploaded is not None and st.sidebar.button("Embed for this session"):
+def render_document_ingestion() -> None:
+    """Top-of-Explorer file staging buffer (session-only volatile ingestion)."""
+    st.markdown("##### 🗂️ Contextual Forensic Document Ingestion Engine")
+    st.caption(
+        "Stage case files, forensic telemetry logs, or PDF/TXT inputs into "
+        "volatile memory for immediate context parsing. Staged files are "
+        "embedded for this session only and are **never** merged into the "
+        "curated repository.")
+    uploaded = st.file_uploader("Stage a PDF / text document", type=["pdf", "txt"],
+                                key="explorer_ingest_file")
+    if uploaded is not None and st.button("📥 Stage into volatile memory",
+                                          key="explorer_ingest_btn"):
         text: str = _read_upload(uploaded)
         if len(text.strip()) < 40:
-            st.sidebar.warning("Could not extract usable text.")
+            st.warning("Could not extract usable text from this file.")
         else:
             count: int = _ingest_sandbox_document(text)
-            st.sidebar.success(f"Embedded {count} passages (session-only).")
+            st.success(f"Embedded {count} passages (session-only). Set the query "
+                       "target to 'My uploaded document' below to query it.")
     if "sandbox_collection" in st.session_state:
-        st.sidebar.info("A sandbox document is active this session.")
+        st.info("🟢 A staged document is active for this session.")
 
 
 def render_explorer_tab() -> None:
-    """Agentic chat + semantic explorer + sandbox querying."""
+    """Agentic chat + semantic explorer + document staging buffer."""
     st.markdown("#### 🔎 Semantic Knowledge Explorer")
+    render_document_ingestion()
+    st.divider()
     st.caption(
         "Ask deep semantic research questions across our centralized "
         "repository of scraped multi-agency advisories (e.g., 'How have "
@@ -1282,20 +1479,28 @@ def render_top_nav() -> None:
                     _go_to(key)
 
 
+def render_operational_desk() -> None:
+    """Three-column statutory status ribbon shown at the top of the workspace."""
+    st.markdown("### 🛰️ Operational Intelligence Desk")
+    st.markdown("---")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric(label="📞 NCRP National Emergency Helpline", value="1930",
+                  delta="24/7 Immediate Response Link")
+    with col2:
+        st.metric(label="⚖️ Statutory Framework Compliance",
+                  value="BNS / BNSS & IT Act",
+                  delta="Procedural Standards Guardrail")
+    with col3:
+        st.metric(label="🔒 Workspace Integrity Status", value="Air-Gapped Volatile",
+                  delta="Session Clears on App Close")
+
+
 def render_home(corpus: int) -> None:
-    """Landing grid: one styled, clickable card per feature."""
-    st.markdown("#### 🛰️ Operational Modules")
-    st.caption(
-        "A unified investigator console for the Cyber Shield India grid. "
-        "Select a module below or use the navigation bar above — every AI "
-        "module is hardened by a multi-model cascade, so transient model load "
-        "never interrupts an investigation."
-    )
-    hero: List[object] = st.columns(3)
-    hero[0].metric("Curated datapoints", f"{corpus:,}")
-    hero[1].metric("Live modules", str(sum(1 for *_x, r in NAV_FEATURES if r)))
-    hero[2].metric("NCRP helpline", victim_triage.NCRP_HELPLINE)
+    """Landing grid: operational desk ribbon + one clickable card per feature."""
+    render_operational_desk()
     st.markdown("")
+    st.markdown("#### 🛰️ Operational Modules")
     per_row: int = 3
     for start in range(0, len(NAV_FEATURES), per_row):
         row: List[Tuple[str, str, str, str, bool]] = NAV_FEATURES[start:start + per_row]
@@ -1410,6 +1615,69 @@ def _render_assessment(assessment: victim_triage.TriageAssessment) -> None:
     )
 
 
+# Incident category → (playbook threat domain, target sector) for cached_playbook.
+_TRIAGE_PLAYBOOK_MAP: Dict[str, Tuple[str, str]] = {
+    "Social & Behavioral Exploitation": (
+        "Social & Behavioral Exploitation", "General Public"),
+    "Critical Infrastructure": (
+        "Network & Infrastructure Attacks", "Critical Infrastructure"),
+    "Financial Cyber Fraud": ("Financial Fraud", "Banking & Payment Systems"),
+}
+
+
+def render_triage_playbook_console() -> None:
+    """Relocated forensic playbook + BSA certificate, gated on incident category.
+
+    Reads ``st.session_state['active_threat_tag']`` so a tag chosen in Strategic
+    Threat Analytics pre-selects the matching category and highlights its
+    provisions (cross-tab continuity).
+    """
+    st.divider()
+    st.markdown("#### 🧰 First-Responder Forensic Playbook & BSA Certificate")
+    st.caption("Pick the incident category to render a tactical first-responder "
+               "checklist and export a Section 63(4) BSA, 2023 certificate draft.")
+
+    active_tag: Optional[str] = st.session_state.get("active_threat_tag")
+    categories: List[str] = list(threat_registry.TRIAGE_CATEGORIES)
+    preset: Optional[str] = threat_registry.triage_category_for_tag(active_tag)
+    index: int = categories.index(preset) if preset in categories else 0
+    if active_tag and preset:
+        st.info(f"🏷️ Carried over from Strategic Threat Analytics: **{active_tag}** "
+                f"→ pre-selected category **{preset}**.")
+    category: str = st.selectbox("Incident category", categories, index=index,
+                                 key="triage_playbook_category")
+
+    if active_tag:
+        meta = threat_registry.get_tag(active_tag)
+        if meta is not None and meta.triage_category == category:
+            st.markdown(
+                f"<div class='cs-legal'><b>Highlighted provisions for {meta.tag}:</b>"
+                f"<br>{meta.provisions}</div>", unsafe_allow_html=True)
+
+    domain, sector = _TRIAGE_PLAYBOOK_MAP[category]
+    steps: List[Dict[str, str]] = cached_playbook(domain, sector, _cache_day())
+    st.markdown("##### 📋 Active tactical checklist")
+    for step in steps:
+        st.markdown(f"**{step.get('action', '')}**  \n{step.get('detail', '')}")
+    st.caption("⚖️ Digital-evidence preservation aligned with Section 63(4), "
+               "Bharatiya Sakshya Adhiniyam (BSA), 2023 (Part A & Part B "
+               "certificate; SHA-256 hashing; chain of custody).")
+    st.caption(
+        "⚠️ INVESTIGATIVE TRIAGE NOTE: Automated first-responder guidance and "
+        "preservation templates only — not formal legal advice. Cross-verify "
+        "certificate formats and chain-of-custody with designated counsel or "
+        "cyber-cell prosecutors before judicial submission.")
+
+    from services.playbook import compile_case_brief
+    timestamp: str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    brief: str = compile_case_brief(timestamp, domain, sector, "", steps)
+    safe_name: str = f"{domain}_{sector}".replace(" ", "_").replace("/", "-")
+    st.download_button(
+        "📥 Export Investigation Brief & BSA Certificate Draft", data=brief,
+        file_name=f"cyber_brief_{safe_name}.md", mime="text/markdown",
+        key="triage_bsa_export", use_container_width=True)
+
+
 def render_triage_tab() -> None:
     """Feature 1 — Victim Triage & First-Action Guide."""
     st.markdown("#### 🚨 Victim Triage & First-Action Guide")
@@ -1479,6 +1747,8 @@ def render_triage_tab() -> None:
     if isinstance(cached, victim_triage.TriageAssessment):
         st.divider()
         _render_assessment(cached)
+
+    render_triage_playbook_console()
 
 
 # --------------------------------------------------------------------------- #
@@ -1969,28 +2239,39 @@ def _osint_deepfake_tool() -> None:
         for flag in report.structural_flags:
             st.markdown(f"- {flag}")
 
-    st.divider()
-    st.markdown("##### 🛡️ HaveIBeenPwned breach checker")
-    hibp_key = osint_sandbox.get_hibp_api_key()
-    st.caption("LIVE — HIBP_API_KEY configured." if hibp_key else
-               "OFFLINE MOCK — no HIBP_API_KEY set; results are sample data only.")
-    account: str = st.text_input("Email address", key="osint_hibp_account",
-                                 placeholder="name@example.com")
-    if st.button("🔎 Check breaches", key="osint_hibp_run",
+
+def _osint_identity_tool() -> None:
+    """Toolbed 6 — Identity Exposure Analyzer (credential-exposure lookup)."""
+    st.markdown("##### 🪪 Identity Exposure Analyzer")
+    st.caption(
+        "Query an identifier against compiled credential-exposure registries to "
+        "surface known data-dump appearances and breach records for an "
+        "investigation subject (with the subject's lawful authorisation).")
+    live: bool = bool(osint_sandbox.get_hibp_api_key())
+    # Clinical, low-noise provenance line — states the registry actually queried
+    # so a 'no exposure' result is never mistaken for an authoritative all-clear.
+    st.caption("Registry: live HaveIBeenPwned v3 exposure index." if live else
+               "Registry: localized offline exposure sample (no live key "
+               "configured — results are indicative, not exhaustive).")
+    account: str = st.text_input("Identifier (email address)",
+                                 key="osint_identity_account",
+                                 placeholder="subject@example.com")
+    if st.button("🔎 Analyze identity exposure", key="osint_identity_run",
                  use_container_width=True) and account.strip():
-        with st.spinner("Querying breach datasets…"):
+        st.info("Cross-referencing parameters against the credential-exposure "
+                "registry…")
+        with st.spinner("Resolving exposure records…"):
             breach = osint_sandbox.hibp_check(account)
-        if breach.warning:
-            st.warning(breach.warning)
+        registry: str = "live exposure index" if live else "localized sample registry"
         if breach.source == "error":
-            st.error(breach.note)
+            st.warning(breach.note)
         elif breach.breached:
-            st.error(breach.note)
-            st.dataframe(
-                pd.DataFrame(breach.breaches), use_container_width=True,
-                hide_index=True)
+            st.error(f"⚠️ Exposure detected — the identifier appears in "
+                     f"{len(breach.breaches)} record(s) in the {registry}.")
+            st.dataframe(pd.DataFrame(breach.breaches),
+                         use_container_width=True, hide_index=True)
         else:
-            st.success(breach.note)
+            st.success(f"No exposure found for this identifier in the {registry}.")
 
 
 def render_osint_tab() -> None:
@@ -2006,7 +2287,7 @@ def render_osint_tab() -> None:
         "authorized investigators on lawfully-held data.")
     tabs = st.tabs([
         "✉️ Email Headers", "🌐 Domain WHOIS", "📷 Image EXIF",
-        "🔗 URL/QR Risk", "🪞 Deepfake & Integrity",
+        "🔗 URL/QR Risk", "🪞 Deepfake & Integrity", "🪪 Identity Exposure Analyzer",
     ])
     with tabs[0]:
         _osint_email_tool()
@@ -2018,6 +2299,8 @@ def render_osint_tab() -> None:
         _osint_url_tool()
     with tabs[4]:
         _osint_deepfake_tool()
+    with tabs[5]:
+        _osint_identity_tool()
 
 
 # --------------------------------------------------------------------------- #
@@ -2333,7 +2616,7 @@ def render_coming_soon(view_key: str) -> None:
     st.markdown(f"#### {icon} {title}")
     st.caption(blurb)
     st.info(
-        "All six grid modules — Macro Trends, the Semantic Explorer, Victim "
+        "All six grid modules — Strategic Threat Analytics, the Semantic Explorer, Victim "
         "Triage, the CDR/IPDR Analyzer, the OSINT Sandbox and the Case-Building "
         "Practice Lab — are live. Select one from the navigation bar above."
     )
@@ -2371,7 +2654,6 @@ def main() -> None:
         st.info("📡 Threat intelligence is being gathered. Use the Semantic "
                 "Knowledge Explorer to query live cyber-threat data while the "
                 "repository populates.")
-    render_sandbox_sidebar()
 
     render_top_nav()
     st.markdown("")

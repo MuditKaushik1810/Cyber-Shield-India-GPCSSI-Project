@@ -14,7 +14,20 @@ from pathlib import Path
 from typing import Dict, List
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
+
+# Guarantee the Gemini chat wrapper is always bound — eliminating the runtime
+# NameError at the ``llm = ChatGoogleGenerativeAI(...)`` call site even if an
+# older/renamed LangChain Google GenAI wrapper variant is installed.
+try:
+    from langchain_google_genai import ChatGoogleGenerativeAI
+except ImportError:  # pragma: no cover - defensive against wrapper renames
+    try:
+        from langchain.chat_models import ChatGoogleGenerativeAI  # type: ignore
+    except ImportError as _exc:  # pragma: no cover
+        raise ImportError(
+            "langchain-google-genai is required for the briefing engine. "
+            "Install it with:  pip install langchain-google-genai"
+        ) from _exc
 
 from core.config import GEMINI_FLASH_MODEL as _FLASH, get_google_api_key
 # Using an explicit relative import clears the IDE linter path resolution error
@@ -137,7 +150,7 @@ def generate_briefing(stats: Dict[str, object], interval: str) -> str:
     # template renders, so the briefing never crashes the page.
     for model_name in MODEL_CASCADE_ORDER:
         try:
-            llm = ChatGoogleGenerAI(
+            llm = ChatGoogleGenerativeAI(
                 model=model_name, temperature=0.3, google_api_key=api_key,
             )
             completion = llm.invoke(messages)
