@@ -14,11 +14,11 @@ from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_google_genai._common import GoogleGenerativeAIError
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 
-from core.config import get_google_api_key
+# Standardized multi-model cascade (5-tier Gemini MODEL_CASCADE_ORDER, transient
+# 429/503-safe) — the same resilience loop used by briefing / RAG synthesis.
+from services.llm_client import invoke_structured
 from services.web_search import web_search, web_search_available
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
@@ -45,9 +45,6 @@ def _build_logger() -> logging.Logger:
 
 
 LOGGER: logging.Logger = _build_logger()
-
-from core.config import GEMINI_FLASH_MODEL as _FLASH
-GEMINI_MODEL_NAME: str = _FLASH
 
 
 def web_seed_available() -> bool:
@@ -120,19 +117,15 @@ def parse_web_threats(
         f"{i + 1}. TITLE: {r.get('title', '')} | SNIPPET: {r.get('snippet', '')}"
         for i, r in enumerate(web_results)
     )
-    try:
-        llm = ChatGoogleGenerativeAI(
-            model=GEMINI_MODEL_NAME, temperature=0.0,
-            google_api_key=get_google_api_key(),
-        ).with_structured_output(WebThreatBatch)
-        batch: Optional[WebThreatBatch] = llm.invoke([
-            SystemMessage(content=_THREAT_PARSE_PROMPT),
-            HumanMessage(content=f"SEARCH RESULTS:\n{numbered}"),
-        ])
-    except (GoogleGenerativeAIError, ValidationError, ValueError):
-        LOGGER.exception("web threat parse failed — skipping relational seed")
-        return []
+    # Multi-model cascade: 429/503 transient faults step down the model chain;
+    # a None return means every tier was unavailable -> skip relational seeding.
+    batch: Optional[WebThreatBatch] = invoke_structured(
+        [SystemMessage(content=_THREAT_PARSE_PROMPT),
+         HumanMessage(content=f"SEARCH RESULTS:\n{numbered}")],
+        WebThreatBatch, origin="web_seed.parse_web_threats", temperature=0.0,
+    )
     if batch is None:
+        LOGGER.warning("web threat parse: cascade exhausted — skipping seed")
         return []
     LOGGER.info("parse_web_threats: %d record(s)", len(batch.records))
     return batch.records
@@ -194,20 +187,17 @@ def web_sourced_advisories(
          "url": r.get("link", "")}
         for r in results[:max_items]
     ]
-    try:
-        llm = ChatGoogleGenerativeAI(
-            model=GEMINI_MODEL_NAME, temperature=0.0,
-            google_api_key=get_google_api_key(),
-        ).with_structured_output(WebAdvisoryList)
-        extracted: Optional[WebAdvisoryList] = llm.invoke([
-            SystemMessage(content=_ADVISORY_PROMPT),
-            HumanMessage(content=(
-                f"SEARCH RESULTS for '{query}':\n{_results_context(results)}")),
-        ])
-    except (GoogleGenerativeAIError, ValidationError, ValueError):
-        LOGGER.exception("advisory extraction failed — using raw web results")
-        return raw_fallback
+    # Standardized cascade: each model is tried in MODEL_CASCADE_ORDER and a
+    # transient 429/503 (the ServerError that crashed this tab) steps down to the
+    # next tier. A None return = full pass-through failure -> raw web results.
+    extracted: Optional[WebAdvisoryList] = invoke_structured(
+        [SystemMessage(content=_ADVISORY_PROMPT),
+         HumanMessage(content=(
+             f"SEARCH RESULTS for '{query}':\n{_results_context(results)}"))],
+        WebAdvisoryList, origin="web_seed.advisories", temperature=0.0,
+    )
     if extracted is None or not extracted.advisories:
+        LOGGER.warning("advisory extraction: cascade exhausted — raw web results")
         return raw_fallback
     cards: List[Dict[str, str]] = [
         {"title": a.title, "description": a.description, "url": a.url}
@@ -259,24 +249,20 @@ def regional_insight(label: str) -> Dict[str, object]:
         {"title": r.get("title", ""), "url": r.get("link", "")}
         for r in results[:3]
     ]
-    try:
-        llm = ChatGoogleGenerativeAI(
-            model=GEMINI_MODEL_NAME, temperature=0.2,
-            google_api_key=get_google_api_key(),
-        ).with_structured_output(RegionalInsight)
-        insight: Optional[RegionalInsight] = llm.invoke([
-            SystemMessage(content=_INSIGHT_PROMPT),
-            HumanMessage(content=(
-                f"SUBJECT: {subject}\nSEARCH RESULTS:\n"
-                f"{_results_context(results)}")),
-        ])
-    except (GoogleGenerativeAIError, ValidationError, ValueError):
-        LOGGER.exception("regional insight failed — using snippet fallback")
+    # Cascade across the model chain; transient 429/503 faults fail over to the
+    # next tier instead of crashing. None = full failure -> snippet fallback.
+    insight: Optional[RegionalInsight] = invoke_structured(
+        [SystemMessage(content=_INSIGHT_PROMPT),
+         HumanMessage(content=(
+             f"SUBJECT: {subject}\nSEARCH RESULTS:\n"
+             f"{_results_context(results)}"))],
+        RegionalInsight, origin="web_seed.regional_insight", temperature=0.2,
+    )
+    if insight is None:
+        LOGGER.warning("regional insight: cascade exhausted — snippet fallback")
         snippet: str = " ".join(r.get("snippet", "") for r in results[:2])[:400]
         return {"summary": snippet, "estimate": "Qualitative",
                 "threat_level": "Unknown", "sources": sources}
-    if insight is None:
-        return {}
     LOGGER.info("regional_insight: %r -> %s", subject, insight.threat_level)
     return {
         "summary": insight.summary,
