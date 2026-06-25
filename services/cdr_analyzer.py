@@ -27,7 +27,7 @@ obtained records.
 import io
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -487,3 +487,136 @@ def sample_schema_csv() -> str:
         "9933221100,,2026-06-20 03:20:00,0,,356938035643801,404459876543210,10.21.4.55,40988,185.199.108.153",
     ]
     return header + "\n" + "\n".join(rows) + "\n"
+
+
+# --------------------------------------------------------------------------- #
+# Flexible arbitrary-schema ingestion + LLM forensic inference.               #
+# --------------------------------------------------------------------------- #
+#
+# The chains above require a recognised CDR/IPDR schema. For arbitrary user CSVs
+# (any column layout), this path reads the file WITHOUT structural validation and
+# routes a bounded header+row sample through the 5-tier model cascade so the
+# analyst always gets a forensic read — no hardcoded-column crash.
+
+# How many rows of the upload to show the model (headers + a bounded sample keep
+# the payload well inside the context budget on large files).
+_FORENSIC_SAMPLE_ROWS: int = 50
+
+_FORENSIC_SYSTEM_PROMPT: str = (
+    "You are an elite digital-forensics intelligence analyst supporting an "
+    "AUTHORIZED law-enforcement examination of lawfully-obtained telecom / "
+    "financial records. You are handed the HEADER ROW and a SAMPLE of rows from "
+    "an arbitrary CSV whose schema is UNKNOWN. Read it the way an expert analyst "
+    "reads a raw log and produce a clinical report with these clearly-headed "
+    "sections, using bullet points:\n"
+    "1. SCHEMA DEDUCTION — infer what each column most likely represents "
+    "(A-party/caller, B-party/callee, timestamps, call duration, cell-tower / "
+    "CGI / LAC, IMEI, IMSI, source/destination IP & port, transaction amount, "
+    "account/UPI handle, latitude/longitude, etc.) and note your confidence.\n"
+    "2. PATTERN ISOLATION — describe the dominant call / transaction patterns: "
+    "high-frequency counterparts, talk-time or amount concentration, repeated "
+    "short-duration bursts, periodic activity.\n"
+    "3. CRITICAL ANOMALY FLAGS — explicitly call out signals visible in the "
+    "sample: continuous night-time / odd-hour movement, rapid geographic or "
+    "cell-tower jumps, localized co-location correlation clusters, a single "
+    "handset (IMEI) reused across SIMs or an IMSI seen on multiple handsets, "
+    "and rapid fund layering across accounts.\n"
+    "4. FORENSIC SUMMARY — a concise, descriptive narrative of the subject's "
+    "operating pattern with prioritised investigative leads.\n"
+    "Reason ONLY from the data shown. If the sample is insufficient to support a "
+    "claim, say so plainly. NEVER fabricate values, names or figures that are "
+    "not present in the sample."
+)
+
+
+def read_csv_flexible(buffer: bytes, filename: str) -> pd.DataFrame:
+    """Read ANY CSV / Excel into a DataFrame — no schema-validation barrier.
+
+    Raises :class:`CDRSchemaError` only on a genuine parse failure or an empty
+    file, never for an unrecognised column layout.
+    """
+    name: str = (filename or "").lower()
+    try:
+        if name.endswith((".xlsx", ".xls")):
+            frame: pd.DataFrame = pd.read_excel(io.BytesIO(buffer))
+        else:
+            frame = pd.read_csv(io.BytesIO(buffer))
+    except (ValueError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
+        raise CDRSchemaError(f"Could not parse the file: {exc}") from exc
+    except ImportError as exc:  # openpyxl missing for .xlsx
+        raise CDRSchemaError(
+            "Reading Excel needs the 'openpyxl' package — please upload CSV "
+            "instead, or install openpyxl.") from exc
+    if frame.empty:
+        raise CDRSchemaError("The uploaded file contains no rows.")
+    return frame
+
+
+def try_build_analysis(frame: pd.DataFrame) -> Optional[CDRAnalysis]:
+    """Run the deterministic engine if the schema is recognised, else None.
+
+    Never raises for an unrecognised / partial layout — the rigid-lookup faults
+    (missing canonical column, un-parseable timestamp, empty group) are caught so
+    the caller can fall back to the LLM forensic inference without a crash.
+    """
+    try:
+        return build_analysis(normalize_schema(frame.copy()))
+    except (CDRSchemaError, KeyError, ValueError, IndexError) as exc:
+        LOGGER.info("deterministic CDR chains skipped (%s) — arbitrary schema",
+                    type(exc).__name__)
+        return None
+
+
+def _stringify_sample(frame: pd.DataFrame,
+                      max_rows: int = _FORENSIC_SAMPLE_ROWS) -> str:
+    """Render headers + a bounded row sample into a compact text payload."""
+    sample: pd.DataFrame = frame.head(max_rows)
+    header: str = ", ".join(str(c) for c in frame.columns)
+    return (f"FILE COLUMNS ({len(frame.columns)}): {header}\n"
+            f"TOTAL ROWS: {len(frame):,} (showing the first {len(sample)})\n\n"
+            f"SAMPLE ROWS (CSV):\n{sample.to_csv(index=False)}")
+
+
+def _forensic_fallback(frame: pd.DataFrame) -> str:
+    """Deterministic descriptive read when every cascade model is unavailable."""
+    columns: List[str] = [str(c) for c in frame.columns]
+    lines: List[str] = [
+        "### 🕵️ Forensic summary (deterministic — AI cascade at capacity)",
+        "",
+        "**Schema deduction**",
+        f"- {len(frame):,} rows across {len(columns)} columns.",
+        f"- Columns present: {', '.join(columns)}.",
+        "",
+        "**Column population**",
+    ]
+    for column in columns[:20]:
+        non_null: int = int(frame[column].notna().sum())
+        distinct: int = int(frame[column].nunique(dropna=True))
+        lines.append(f"- `{column}`: {non_null:,} populated, "
+                     f"{distinct:,} distinct values.")
+    lines.append("")
+    lines.append("_Re-run the AI forensic investigation once model capacity "
+                 "recovers for column-identity deduction and anomaly flagging._")
+    return "\n".join(lines)
+
+
+def forensic_infer(frame: pd.DataFrame, filename: str = "") -> str:
+    """LLM forensic inference over an arbitrary-schema record sample (cascade-safe).
+
+    Routes the headers + a bounded row sample through the 5-tier ``invoke_text``
+    cascade. Returns a deterministic descriptive read if every model is down.
+    """
+    payload: str = _stringify_sample(frame)
+    messages = [
+        SystemMessage(content=_FORENSIC_SYSTEM_PROMPT),
+        HumanMessage(content=(f"SOURCE FILE: {filename or 'uploaded.csv'}\n\n"
+                              f"{payload}")),
+    ]
+    report: str = invoke_text(messages, origin="cdr_analyzer.forensic_infer",
+                              temperature=0.2)
+    if report.strip():
+        LOGGER.info("forensic_infer: report generated for %r (%d rows)",
+                    filename, len(frame))
+        return report
+    LOGGER.warning("forensic_infer: cascade exhausted — deterministic fallback")
+    return _forensic_fallback(frame)
