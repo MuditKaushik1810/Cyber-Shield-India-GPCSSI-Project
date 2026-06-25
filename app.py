@@ -231,6 +231,65 @@ section[data-testid="stSidebar"] [data-testid="stFileUploader"] button {
 section[data-testid="stSidebar"] [data-testid="stFileUploader"] button:hover {
     background-color: #0C8AE0 !important;
 }
+/* === GLOBAL file-uploader (main content area) — high contrast =========
+   The dropzone inherits the navy secondaryBackgroundColor, so its 'Browse
+   files' button was navy-on-navy and vanished on hover. Force a solid blue
+   button with a white border/label and a brighter hover everywhere. */
+[data-testid="stFileUploaderDropzone"] {
+    background-color: #14304A !important;
+    border: 1.5px dashed #7FB3D5 !important;
+    border-radius: 8px !important;
+}
+[data-testid="stFileUploaderDropzone"] *,
+[data-testid="stFileUploaderDropzoneInstructions"] * {
+    color: #EAF2FA !important;
+}
+[data-testid="stFileUploader"] button,
+[data-testid="stFileUploaderDropzone"] button {
+    background-color: #0A74B9 !important;
+    color: #FFFFFF !important;
+    border: 1.5px solid #FFFFFF !important;
+    font-weight: 700 !important;
+    opacity: 1 !important;
+}
+[data-testid="stFileUploader"] button:hover,
+[data-testid="stFileUploader"] button:focus,
+[data-testid="stFileUploaderDropzone"] button:hover,
+[data-testid="stFileUploaderDropzone"] button:focus {
+    background-color: #0C8AE0 !important;
+    color: #FFFFFF !important;
+    border-color: #FFFFFF !important;
+}
+[data-testid="stFileUploader"] button:hover *,
+[data-testid="stFileUploaderDropzone"] button:hover * { color: #FFFFFF !important; }
+/* === GLOBAL buttons — guarantee a visible hover/active state app-wide ==
+   Secondary (default) buttons: blue label on a pale-blue fill with a blue
+   border. Primary (blue) buttons: white label on a brighter-blue fill. */
+.stButton > button:hover,
+.stButton > button:focus,
+.stDownloadButton > button:hover,
+.stDownloadButton > button:focus,
+.stFormSubmitButton > button:hover,
+.stFormSubmitButton > button:focus {
+    background-color: #EAF2FA !important;
+    color: #0A74B9 !important;
+    border: 1px solid #0A74B9 !important;
+}
+.stButton > button:hover p,
+.stDownloadButton > button:hover p,
+.stFormSubmitButton > button:hover p { color: #0A74B9 !important; }
+.stButton > button[kind="primary"]:hover,
+.stButton > button[kind="primary"]:focus,
+.stButton > button[data-testid="stBaseButton-primary"]:hover,
+.stDownloadButton > button[kind="primary"]:hover,
+.stFormSubmitButton > button[kind="primary"]:hover {
+    background-color: #0C8AE0 !important;
+    color: #FFFFFF !important;
+    border: 1px solid #FFFFFF !important;
+}
+.stButton > button[kind="primary"]:hover p,
+.stButton > button[data-testid="stBaseButton-primary"]:hover p,
+.stDownloadButton > button[kind="primary"]:hover p { color: #FFFFFF !important; }
 /* === Home feature-card grid =========================================== */
 .cs-card {
     border: 1px solid #1E3A5F; border-top: 4px solid #0A74B9;
@@ -1765,41 +1824,8 @@ def _cdr_table(title: str, frame: pd.DataFrame, empty: str) -> None:
         st.dataframe(frame, use_container_width=True, hide_index=True)
 
 
-def render_cdr_tab() -> None:
-    """Feature 2 — Pandas forensic engine over CDR/IPDR with an AI breakdown."""
-    st.markdown("#### 📞 CDR & IPDR Operational Analyzer")
-    st.caption(
-        "Upload Call Detail Records (CDR) or IP Detail Records (IPDR) as CSV or "
-        "Excel. The engine runs real Pandas analytics — B-Party frequency, "
-        "odd-hour anomalies, shared IMEI/IMSI links and spatial-temporal tower "
-        "footprints — then hands only the aggregated summaries to the AI for a "
-        "digital-forensics breakdown. For authorized investigators using their "
-        "own lawfully obtained records."
-    )
-
-    st.download_button(
-        "⬇️ Download sample schema (CSV)", data=cdr_analyzer.sample_schema_csv(),
-        file_name="cdr_ipdr_sample_schema.csv", mime="text/csv",
-        help="A valid mixed CDR+IPDR dataset you can upload immediately to test.",
-    )
-    uploaded = st.file_uploader(
-        "Upload CDR / IPDR file", type=["csv", "xlsx", "xls"],
-        accept_multiple_files=False,
-    )
-    if uploaded is None:
-        st.info("Upload a record set, or grab the sample schema above to test "
-                "with valid columns: Caller, Callee, Timestamp, Duration, Cell "
-                "Tower ID, IMEI, IMSI, Source IP, Port, Destination IP.")
-        return
-
-    try:
-        frame = cdr_analyzer.load_dataframe(uploaded.getvalue(), uploaded.name)
-        analysis = cdr_analyzer.build_analysis(frame)
-    except cdr_analyzer.CDRSchemaError as exc:
-        st.error(f"Could not analyze this file: {exc}")
-        return
-
-    signature: str = f"{uploaded.name}:{analysis.record_count}"
+def _render_cdr_structured(analysis: "cdr_analyzer.CDRAnalysis") -> None:
+    """Render the deterministic CDR/IPDR analytics (recognised-schema path)."""
     kpi: List[object] = st.columns(4)
     kpi[0].metric("Records", f"{analysis.record_count:,}")
     kpi[1].metric("CDR / IPDR", f"{analysis.cdr_count} / {analysis.ipdr_count}")
@@ -1835,16 +1861,69 @@ def render_cdr_tab() -> None:
         _cdr_table("🚀 Rapid tower hand-offs", analysis.rapid_handoff,
                    "No implausibly fast tower changes detected.")
 
-    st.divider()
-    st.markdown("##### 🕵️ AI digital-forensics breakdown")
-    if st.button("🧠 Run forensic investigation", type="primary",
-                 use_container_width=True):
-        with st.spinner("Correlating aggregated patterns…"):
-            brief: str = cdr_analyzer.investigate(analysis)
-        st.session_state["cdr_brief"] = (signature, brief)
-        LOGGER.info("cdr breakdown generated for %s", signature)
 
-    cached = st.session_state.get("cdr_brief")
+def render_cdr_tab() -> None:
+    """Feature 2 — schema-agnostic CDR/IPDR analyzer with AI forensic inference."""
+    st.markdown("#### 📞 CDR & IPDR Operational Analyzer")
+    st.caption(
+        "Upload **any** CDR / IPDR or transaction CSV / Excel — no fixed schema "
+        "required. When a recognised CDR/IPDR layout is detected the engine runs "
+        "deterministic Pandas analytics (B-Party, odd-hour, IMEI/IMSI links, "
+        "tower footprints); for arbitrary layouts it routes the data into the "
+        "AI forensic inference, which deduces the columns and flags anomalies. "
+        "For authorized investigators using their own lawfully obtained records."
+    )
+
+    st.download_button(
+        "⬇️ Download sample schema (CSV)", data=cdr_analyzer.sample_schema_csv(),
+        file_name="cdr_ipdr_sample_schema.csv", mime="text/csv",
+        help="A valid mixed CDR+IPDR dataset you can upload immediately to test.",
+    )
+    uploaded = st.file_uploader(
+        "Upload CDR / IPDR / transaction file (any CSV or Excel)",
+        type=["csv", "xlsx", "xls"], accept_multiple_files=False,
+    )
+    if uploaded is None:
+        st.info("Upload any record set — arbitrary column layouts are fully "
+                "supported. Use the AI forensic inference for non-standard files.")
+        return
+
+    # Flexible read: NO schema barrier — only a genuine parse failure stops here.
+    try:
+        frame = cdr_analyzer.read_csv_flexible(uploaded.getvalue(), uploaded.name)
+    except cdr_analyzer.CDRSchemaError as exc:
+        st.error(f"Could not read this file: {exc}")
+        return
+
+    signature: str = f"{uploaded.name}:{len(frame)}"
+    st.markdown(f"**📄 Loaded {len(frame):,} rows × {len(frame.columns)} columns** "
+                f"— `{uploaded.name}`")
+    st.dataframe(frame.head(25), use_container_width=True, hide_index=True)
+
+    # Opportunistic deterministic engine — runs only if the schema is recognised,
+    # and never crashes the tab on an unrecognised layout.
+    analysis = cdr_analyzer.try_build_analysis(frame)
+    if analysis is not None:
+        st.success("✅ Recognised CDR/IPDR schema — deterministic analytics below.")
+        _render_cdr_structured(analysis)
+    else:
+        st.info("ℹ️ Non-standard schema detected — deterministic CDR chains "
+                "skipped. Use the AI forensic inference below to analyse this "
+                "layout directly.")
+
+    st.divider()
+    st.markdown("##### 🕵️ AI digital-forensics inference")
+    st.caption("Routes the headers and a bounded row sample through the 5-tier "
+               "model cascade; the analyst-grade model deduces the columns, "
+               "isolates call/transaction patterns and flags critical anomalies.")
+    if st.button("🧠 Run AI forensic investigation", type="primary",
+                 use_container_width=True):
+        with st.spinner("Reasoning over the record sample…"):
+            report: str = cdr_analyzer.forensic_infer(frame, uploaded.name)
+        st.session_state["cdr_forensic"] = (signature, report)
+        LOGGER.info("cdr forensic inference generated for %s", signature)
+
+    cached = st.session_state.get("cdr_forensic")
     if isinstance(cached, tuple) and cached[0] == signature:
         with st.container(border=True):
             st.markdown(cached[1])
@@ -1853,6 +1932,12 @@ def render_cdr_tab() -> None:
 # --------------------------------------------------------------------------- #
 # Feature 3 — Integrated OSINT Sandbox.                                       #
 # --------------------------------------------------------------------------- #
+
+
+# Session keys for OSINT tools that must survive reruns (so a second button — e.g.
+# the AI officer read — does not wipe the first tool's results).
+_WHOIS_STATE_KEY: str = "osint_whois_report"
+_IDENTITY_STATE_KEY: str = "osint_identity_hits"
 
 
 def _osint_custody(filename: str, payload: bytes) -> None:
@@ -1956,15 +2041,26 @@ def _osint_whois_tool() -> None:
         "socket (port 43) query — no system `whois` binary required.")
     domain: str = st.text_input("Domain or URL", key="osint_whois_domain",
                                 placeholder="example.com")
-    if not st.button("🔎 Run WHOIS", key="osint_whois_run",
-                     use_container_width=True):
-        return
-    if not domain.strip():
-        st.warning("Enter a domain such as `example.com`.")
-        return
+    # Run the lookup on click, but PERSIST the result in session_state so the tool
+    # survives the rerun triggered by the AI-officer button below (previously the
+    # function returned early on that rerun, making the officer button look dead).
+    if st.button("🔎 Run WHOIS", key="osint_whois_run", use_container_width=True):
+        if not domain.strip():
+            st.warning("Enter a domain such as `example.com`.")
+        elif not osint_sandbox.is_valid_domain(domain):
+            st.error("❌ Invalid domain — enter a registrable domain like "
+                     "`example.com` (letters, digits and hyphens with a valid "
+                     "TLD). Lookup halted.")
+            st.session_state.pop(_WHOIS_STATE_KEY, None)
+            st.session_state.pop("osint_whois_ai", None)
+        else:
+            with st.spinner("Querying WHOIS registries…"):
+                st.session_state[_WHOIS_STATE_KEY] = osint_sandbox.whois_lookup(domain)
+            st.session_state.pop("osint_whois_ai", None)  # fresh lookup → drop stale read
 
-    with st.spinner("Querying WHOIS registries…"):
-        report = osint_sandbox.whois_lookup(domain)
+    report = st.session_state.get(_WHOIS_STATE_KEY)
+    if report is None:
+        return
     if not report.available:
         st.error(report.error or "WHOIS lookup failed.")
         return
@@ -2183,12 +2279,11 @@ def _osint_deepfake_block(payload: bytes, filename: str) -> str:
             use_container_width=True, hide_index=True)
         summary_parts.append(f"HF[{verdict.model}] top={verdict.top_label} "
                              f"@ {verdict.top_score:.2f}")
-    elif verdict.source == "loading":
-        st.info(verdict.note)
-    elif verdict.source == "no-token":
-        st.info(verdict.note)
     else:
-        st.warning(verdict.note)
+        # Token missing / model cold-starting / network or rate fault: warn clearly
+        # and rely on the local ELA layer above — the tab never crashes.
+        st.warning(f"⚠️ Remote Hugging Face classifier unavailable — {verdict.note} "
+                   "Defaulting to the local ELA pixel-variance scan above.")
     st.caption(f"Model: `{verdict.model}`")
     return "; ".join(summary_parts)
 
@@ -2240,38 +2335,69 @@ def _osint_deepfake_tool() -> None:
             st.markdown(f"- {flag}")
 
 
+_EXPOSURE_RISK_COLOR: Dict[str, str] = {
+    "None": "#1E7E34", "Low": "#1E7E34", "Moderate": "#E0A800",
+    "Elevated": "#D97706", "High": "#C0392B", "Critical": "#7B1E1E",
+}
+
+
 def _osint_identity_tool() -> None:
-    """Toolbed 6 — Identity Exposure Analyzer (credential-exposure lookup)."""
+    """Toolbed 6 — Identity Exposure Analyzer (live parsed breach aggregation)."""
     st.markdown("##### 🪪 Identity Exposure Analyzer")
     st.caption(
-        "Query an identifier against compiled credential-exposure registries to "
-        "surface known data-dump appearances and breach records for an "
-        "investigation subject (with the subject's lawful authorisation).")
-    live: bool = bool(osint_sandbox.get_hibp_api_key())
-    # Clinical, low-noise provenance line — states the registry actually queried
-    # so a 'no exposure' result is never mistaken for an authoritative all-clear.
-    st.caption("Registry: live HaveIBeenPwned v3 exposure index." if live else
-               "Registry: localized offline exposure sample (no live key "
-               "configured — results are indicative, not exhaustive).")
-    account: str = st.text_input("Identifier (email address)",
-                                 key="osint_identity_account",
-                                 placeholder="subject@example.com")
-    if st.button("🔎 Analyze identity exposure", key="osint_identity_run",
-                 use_container_width=True) and account.strip():
-        st.info("Cross-referencing parameters against the credential-exposure "
-                "registry…")
-        with st.spinner("Resolving exposure records…"):
-            breach = osint_sandbox.hibp_check(account)
-        registry: str = "live exposure index" if live else "localized sample registry"
-        if breach.source == "error":
-            st.warning(breach.note)
-        elif breach.breached:
-            st.error(f"⚠️ Exposure detected — the identifier appears in "
-                     f"{len(breach.breaches)} record(s) in the {registry}.")
-            st.dataframe(pd.DataFrame(breach.breaches),
-                         use_container_width=True, hide_index=True)
-        else:
-            st.success(f"No exposure found for this identifier in the {registry}.")
+        "Live breach-data aggregator: ingests public, unauthenticated breach "
+        "intelligence for a target email (XposedOrNot) or domain (HIBP public "
+        "breaches), parses the raw telemetry, and compiles the breach source, "
+        "exposure date and compromised PII data classes into a single graded "
+        "report — no external links to chase.")
+    identifier: str = st.text_input(
+        "Target email or domain", key="osint_identity_account",
+        placeholder="subject@example.com  or  example.com")
+    if st.button("🔎 Aggregate exposure intelligence", key="osint_identity_run",
+                 use_container_width=True) and identifier.strip():
+        with st.spinner("Ingesting and parsing live public breach records…"):
+            report = osint_sandbox.breach_exposure_lookup(identifier.strip())
+        st.session_state[_IDENTITY_STATE_KEY] = report
+
+    report = st.session_state.get(_IDENTITY_STATE_KEY)
+    if not isinstance(report, osint_sandbox.ExposureReport):
+        return
+
+    if report.source == "error":
+        st.warning(f"⚠️ {report.note}")
+        return
+    if not report.found:
+        st.success(f"✅ {report.note} for **{report.identifier}** "
+                   f"({report.kind}). Absence of records is not absolute proof "
+                   "of safety.")
+        return
+
+    color: str = _EXPOSURE_RISK_COLOR.get(report.risk_label, "#7FA8C9")
+    head: List[object] = st.columns([1, 1, 2])
+    head[0].metric("Exposure risk", f"{report.risk_score}/100")
+    head[1].markdown(
+        f"<div style='margin-top:0.6rem'><span class='cs-sev' "
+        f"style='background:{color}'>{report.risk_label.upper()}</span></div>",
+        unsafe_allow_html=True)
+    head[2].metric("Breaches naming this identifier", len(report.breaches))
+    st.caption(f"🛰️ Source: `{report.source}` · {report.kind} · {report.note}")
+
+    st.markdown("**🗂️ Compiled breach telemetry**")
+    st.dataframe(
+        pd.DataFrame([{
+            "Breach Source / Entity": b.source,
+            "Date of Exposure": b.date,
+            "Compromised PII Data Classes": ", ".join(b.data_classes) or "—",
+            "Records": f"{b.records:,}" if b.records else "—",
+        } for b in report.breaches]),
+        use_container_width=True, hide_index=True)
+
+    if report.data_class_tally:
+        st.markdown("**🔬 Exposed data-class frequency (across all breaches)**")
+        chips: str = " ".join(
+            f"<span class='cs-domainchip'>{cls} · {count}</span>"
+            for cls, count in report.data_class_tally.items())
+        st.markdown(chips, unsafe_allow_html=True)
 
 
 def render_osint_tab() -> None:

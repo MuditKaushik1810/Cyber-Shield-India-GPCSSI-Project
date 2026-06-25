@@ -9,6 +9,7 @@ caller falls back to a clean, un-broken zero state.
 """
 
 import logging
+import re
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
@@ -199,12 +200,50 @@ def web_sourced_advisories(
     if extracted is None or not extracted.advisories:
         LOGGER.warning("advisory extraction: cascade exhausted — raw web results")
         return raw_fallback
+    # Deep-link repair: the model can return a lazy bare-domain URL. Re-anchor each
+    # card to the deepest original search-result link (full path/query retained) so
+    # the UI deep-links straight to the article, never a generic landing page.
     cards: List[Dict[str, str]] = [
-        {"title": a.title, "description": a.description, "url": a.url}
+        {"title": a.title, "description": a.description,
+         "url": _deep_link(a.url, a.title, results)}
         for a in extracted.advisories if a.title
     ][:max_items]
     LOGGER.info("web_sourced_advisories: %d card(s) for %r", len(cards), topic)
     return cards or raw_fallback
+
+
+def _has_path(url: str) -> bool:
+    """True if a URL points past the bare domain (has a real article path/query)."""
+    match = re.match(r"^https?://[^/]+(/[^?\s]*|\?[^\s]+)", url.strip(), re.IGNORECASE)
+    return bool(match) and match.group(1) not in ("", "/")
+
+
+def _deep_link(candidate: str, title: str, results: List[Dict[str, str]]) -> str:
+    """Resolve the most specific deep article URL for an advisory card.
+
+    Prefers the model's URL when it already carries a path; otherwise re-anchors
+    to the original web result whose title best overlaps, falling back to the
+    first deep result link, then to the candidate verbatim.
+    """
+    candidate = (candidate or "").strip()
+    if _has_path(candidate):
+        return candidate
+    title_words = {w for w in re.findall(r"[a-z0-9]+", title.lower()) if len(w) > 3}
+    best_url: str = ""
+    best_overlap: int = 0
+    for result in results:
+        link: str = str(result.get("link", "")).strip()
+        if not _has_path(link):
+            continue
+        words = set(re.findall(r"[a-z0-9]+", str(result.get("title", "")).lower()))
+        overlap: int = len(title_words & words)
+        if overlap > best_overlap:
+            best_overlap, best_url = overlap, link
+    if best_url:
+        return best_url
+    first_deep: str = next((str(r.get("link", "")).strip() for r in results
+                            if _has_path(str(r.get("link", "")))), "")
+    return first_deep or candidate
 
 
 # --------------------------------------------------------------------------- #
@@ -270,3 +309,44 @@ def regional_insight(label: str) -> Dict[str, object]:
         "threat_level": insight.threat_level,
         "sources": sources,
     }
+
+
+# --------------------------------------------------------------------------- #
+# 3. Live identity-exposure OSINT search (real web, no mock registry).        #
+# --------------------------------------------------------------------------- #
+
+# Disclosure terms that surface real breach/leak/paste announcements for a target.
+_EXPOSURE_TERMS: str = (
+    '("data breach" OR leaked OR "paste" OR "pastebin" OR dump OR '
+    '"database exposed" OR "breach notification" OR compromised OR "credential leak")')
+
+
+def identity_exposure_available() -> bool:
+    """True when the live identity-exposure web pipeline can run (SerpAPI ready)."""
+    return web_search_available()
+
+
+def identity_exposure_search(
+    identifier: str, max_results: int = 10
+) -> List[Dict[str, str]]:
+    """Live web OSINT sweep for public exposure of an email/domain identifier.
+
+    Queries the live web (SerpAPI) for genuine breach/leak/paste-dump disclosures
+    naming the identifier and returns parsed result cards with deep source links.
+    Empty list when the pipeline is unavailable or nothing surfaces — never a
+    mock/seeded record.
+    """
+    target: str = identifier.strip()
+    if not target:
+        return []
+    query: str = f'"{target}" {_EXPOSURE_TERMS}'
+    results: List[Dict[str, str]] = web_search(query, max_results=max_results)
+    cards: List[Dict[str, str]] = [
+        {"title": r.get("title", "Untitled disclosure"),
+         "snippet": r.get("snippet", ""),
+         "url": r.get("link", "")}
+        for r in results if r.get("link")
+    ]
+    LOGGER.info("identity_exposure_search: %d live result(s) for %r",
+                len(cards), target)
+    return cards

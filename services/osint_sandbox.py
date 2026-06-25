@@ -53,7 +53,12 @@ _WHOIS_TIMEOUT: float = 8.0
 _HIBP_TIMEOUT: float = 10.0
 _HF_TIMEOUT: float = 30.0
 _IANA_WHOIS_HOST: str = "whois.iana.org"
-_HF_INFERENCE_BASE: str = "https://api-inference.huggingface.co/models"
+# Current HF serverless inference router (the legacy api-inference.huggingface.co
+# host was deprecated). Env-overridable so a future endpoint change needs no code
+# edit. Format: <base>/<model-id>.
+_HF_INFERENCE_BASE: str = (
+    os.environ.get("HF_INFERENCE_BASE", "").strip()
+    or "https://router.huggingface.co/hf-inference/models")
 _DEFAULT_HF_DEEPFAKE_MODEL: str = "prithivirajdamodaran/deepfake-image-detector"
 
 # Shared regexes (compiled once).
@@ -459,6 +464,12 @@ class WhoisReport:
 
 
 _DOMAIN_CLEAN_RE: re.Pattern = re.compile(r"^[a-z0-9.\-]+$")
+# Strict FQDN validation: labels of 1-63 chars (no leading/trailing hyphen) and a
+# 2-24 char alphabetic TLD, total <= 253 chars — rejects junk like 'asdf' or
+# 'http://nonsense' so the WHOIS tool never renders an empty profile table.
+_VALID_DOMAIN_RE: re.Pattern = re.compile(
+    r"^(?=.{1,253}$)(?!-)[a-z0-9-]{1,63}(?<!-)(?:\.(?!-)[a-z0-9-]{1,63}(?<!-))*"
+    r"\.[a-z]{2,24}$")
 
 
 def normalize_domain(value: str) -> str:
@@ -470,6 +481,12 @@ def normalize_domain(value: str) -> str:
     if value.startswith("www."):
         value = value[4:]
     return value.strip(".")
+
+
+def is_valid_domain(value: str) -> bool:
+    """True only for a structurally valid, registrable domain (post-normalization)."""
+    clean: str = normalize_domain(value)
+    return bool(clean) and _VALID_DOMAIN_RE.match(clean) is not None
 
 
 def _first(value: object) -> Optional[object]:
@@ -1029,6 +1046,223 @@ def hibp_check(account: str) -> BreachReport:
         LOGGER.warning("hibp: live lookup failed (%s)", type(exc).__name__)
         return BreachReport(account=target, breached=False, source="error",
                             note=f"HIBP network/parse error ({type(exc).__name__}).")
+
+
+# --------------------------------------------------------------------------- #
+# 6b. Identity-exposure aggregator — live, unauthenticated breach ingestion.   #
+# --------------------------------------------------------------------------- #
+#
+# Pulls and PARSES real breach telemetry (never hands the user raw links):
+#   * Email  -> XposedOrNot breach-analytics API (free, unauthenticated).
+#   * Domain -> HaveIBeenPwned public /breaches?domain= (no API key required).
+# Each breach is reduced to {source, date, data_classes, records}, and a
+# deterministic 0-100 risk score is computed from the sensitivity of the exposed
+# PII data classes plus breach breadth.
+
+_XPOSEDORNOT_ANALYTICS: str = "https://api.xposedornot.com/v1/breach-analytics"
+_HIBP_BREACHES_URL: str = "https://haveibeenpwned.com/api/v3/breaches"
+_EXPOSURE_TIMEOUT: float = 12.0
+_EXPOSURE_UA: str = "CyberShieldIndia-OSINT-Sandbox"
+
+# Sensitivity weights (per distinct data class) used for the risk score. Keys are
+# matched as case-insensitive substrings against each breach's data classes.
+_DATA_CLASS_WEIGHTS: Tuple[Tuple[str, int], ...] = (
+    ("password", 25), ("bank account", 25), ("credit card", 25),
+    ("financial", 22), ("cvv", 25), ("government issued id", 20),
+    ("passport", 20), ("social security", 20), ("aadhaar", 20), ("pan ", 18),
+    ("tax", 16), ("security question", 14), ("biometric", 22),
+    ("date of birth", 12), ("phone", 12), ("physical address", 10),
+    ("geographic location", 9), ("ip address", 8), ("device", 6),
+    ("username", 5), ("name", 3), ("email", 4),
+)
+
+
+@dataclass
+class BreachExposure:
+    """One parsed breach record naming the searched identifier."""
+
+    source: str
+    date: str
+    data_classes: List[str] = field(default_factory=list)
+    records: Optional[int] = None
+    password_risk: str = ""
+
+
+@dataclass
+class ExposureReport:
+    """Aggregated, parsed identity-exposure intelligence for one identifier."""
+
+    identifier: str
+    kind: str            # "email" | "domain"
+    found: bool
+    source: str          # "xposedornot" | "hibp-breaches" | "clean" | "error"
+    breaches: List[BreachExposure] = field(default_factory=list)
+    risk_score: int = 0          # 0-100
+    risk_label: str = "None"     # None|Low|Moderate|Elevated|High|Critical
+    data_class_tally: Dict[str, int] = field(default_factory=dict)
+    note: str = ""
+
+
+_EMAIL_RE: re.Pattern = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _class_weight(data_class: str) -> int:
+    """Sensitivity weight for a single data-class label (substring match)."""
+    low: str = data_class.lower()
+    for needle, weight in _DATA_CLASS_WEIGHTS:
+        if needle in low:
+            return weight
+    return 5
+
+
+def _score_exposure(breaches: List[BreachExposure]) -> Tuple[int, str, Dict[str, int]]:
+    """Deterministic 0-100 risk score from exposed PII sensitivity + breadth."""
+    tally: Dict[str, int] = {}
+    distinct: Dict[str, int] = {}
+    for breach in breaches:
+        for data_class in breach.data_classes:
+            label: str = data_class.strip()
+            if not label:
+                continue
+            tally[label] = tally.get(label, 0) + 1
+            distinct[label.lower()] = _class_weight(label)
+    score: int = sum(distinct.values()) + min(len(breaches) * 3, 20)
+    score = max(0, min(score, 100))
+    if not breaches:
+        label = "None"
+    elif score >= 80:
+        label = "Critical"
+    elif score >= 60:
+        label = "High"
+    elif score >= 40:
+        label = "Elevated"
+    elif score >= 20:
+        label = "Moderate"
+    else:
+        label = "Low"
+    ordered: Dict[str, int] = dict(
+        sorted(tally.items(), key=lambda kv: kv[1], reverse=True))
+    return score, label, ordered
+
+
+def _xposedornot_email(email: str) -> ExposureReport:
+    """Email path: ingest & parse XposedOrNot breach-analytics (unauthenticated)."""
+    try:
+        with httpx.Client(timeout=_EXPOSURE_TIMEOUT,
+                          headers={"user-agent": _EXPOSURE_UA}) as client:
+            response = client.get(_XPOSEDORNOT_ANALYTICS,
+                                  params={"email": email})
+        if response.status_code == 404:
+            return ExposureReport(identifier=email, kind="email", found=False,
+                                  source="clean",
+                                  note="No public breach records found for this email.")
+        response.raise_for_status()
+        data = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        LOGGER.warning("exposure(email): lookup failed (%s)", type(exc).__name__)
+        return ExposureReport(identifier=email, kind="email", found=False,
+                              source="error",
+                              note=f"Live exposure lookup failed ({type(exc).__name__}).")
+
+    if isinstance(data, dict) and data.get("Error"):
+        return ExposureReport(identifier=email, kind="email", found=False,
+                              source="clean",
+                              note="No public breach records found for this email.")
+
+    exposed = (data.get("ExposedBreaches") or {}) if isinstance(data, dict) else {}
+    details = exposed.get("breaches_details") or []
+    breaches: List[BreachExposure] = []
+    for item in details:
+        if not isinstance(item, dict):
+            continue
+        classes: List[str] = [c.strip() for c in
+                              str(item.get("xposed_data", "")).split(";") if c.strip()]
+        records_raw = item.get("xposed_records")
+        breaches.append(BreachExposure(
+            source=str(item.get("breach", "Unknown")),
+            date=str(item.get("xposed_date", "—")),
+            data_classes=classes,
+            records=int(records_raw) if isinstance(records_raw, int) else None,
+            password_risk=str(item.get("password_risk", "")),
+        ))
+    if not breaches:
+        return ExposureReport(identifier=email, kind="email", found=False,
+                              source="clean",
+                              note="No public breach records found for this email.")
+    score, label, tally = _score_exposure(breaches)
+    LOGGER.info("exposure(email): %s -> %d breach(es), risk=%s",
+                email, len(breaches), label)
+    return ExposureReport(
+        identifier=email, kind="email", found=True, source="xposedornot",
+        breaches=breaches, risk_score=score, risk_label=label,
+        data_class_tally=tally,
+        note=f"Aggregated {len(breaches)} public breach record(s).")
+
+
+def _hibp_domain(domain: str) -> ExposureReport:
+    """Domain path: ingest & parse HIBP public /breaches?domain= (no API key)."""
+    try:
+        with httpx.Client(timeout=_EXPOSURE_TIMEOUT,
+                          headers={"user-agent": _EXPOSURE_UA}) as client:
+            response = client.get(_HIBP_BREACHES_URL, params={"domain": domain})
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        LOGGER.warning("exposure(domain): lookup failed (%s)", type(exc).__name__)
+        return ExposureReport(identifier=domain, kind="domain", found=False,
+                              source="error",
+                              note=f"Live exposure lookup failed ({type(exc).__name__}).")
+
+    rows = payload if isinstance(payload, list) else []
+    breaches: List[BreachExposure] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        classes: List[str] = [str(c).strip() for c in
+                              (item.get("DataClasses") or []) if str(c).strip()]
+        records_raw = item.get("PwnCount")
+        breaches.append(BreachExposure(
+            source=str(item.get("Title", item.get("Name", "Unknown"))),
+            date=str(item.get("BreachDate", "—")),
+            data_classes=classes,
+            records=int(records_raw) if isinstance(records_raw, int) else None,
+        ))
+    if not breaches:
+        return ExposureReport(identifier=domain, kind="domain", found=False,
+                              source="clean",
+                              note="No public breaches registered for this domain.")
+    score, label, tally = _score_exposure(breaches)
+    LOGGER.info("exposure(domain): %s -> %d breach(es), risk=%s",
+                domain, len(breaches), label)
+    return ExposureReport(
+        identifier=domain, kind="domain", found=True, source="hibp-breaches",
+        breaches=breaches, risk_score=score, risk_label=label,
+        data_class_tally=tally,
+        note=f"Aggregated {len(breaches)} breach(es) registered against this domain.")
+
+
+def breach_exposure_lookup(identifier: str) -> ExposureReport:
+    """Live, parsed identity-exposure aggregation for an email or domain.
+
+    Routes emails to XposedOrNot and domains to HIBP's public breaches endpoint —
+    both unauthenticated — and returns fully-parsed breach telemetry (source,
+    date, PII data classes, record counts) plus a deterministic risk score. No
+    external links are surfaced; the investigator gets the compiled answer.
+    """
+    target: str = (identifier or "").strip()
+    if not target:
+        return ExposureReport(identifier=target, kind="email", found=False,
+                              source="error",
+                              note="Enter a target email address or domain.")
+    if _EMAIL_RE.match(target):
+        return _xposedornot_email(target.lower())
+    domain: str = normalize_domain(target)
+    if is_valid_domain(domain):
+        return _hibp_domain(domain)
+    return ExposureReport(identifier=target, kind="email", found=False,
+                          source="error",
+                          note="Enter a valid email address (name@domain) or a "
+                               "registrable domain (example.com).")
 
 
 # --------------------------------------------------------------------------- #
