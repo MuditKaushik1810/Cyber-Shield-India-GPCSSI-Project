@@ -2,7 +2,7 @@
 
 Loads the local ``.env`` file via python-dotenv and validates that the
 ``GOOGLE_API_KEY`` target is present and non-placeholder before any
-service module attempts a Gemini connection. Per CLAUDE.md security
+service module attempts a Gemini connection. Per the project security
 protocols, no authentication key is ever hardcoded.
 """
 

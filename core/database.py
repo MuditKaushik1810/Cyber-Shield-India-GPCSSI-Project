@@ -12,7 +12,7 @@ collections:
 
 Embeddings ride Chroma's native default embedding component, which is the
 ONNX build of HuggingFace ``all-MiniLM-L6-v2`` — the exact open-source
-model mandated by CLAUDE.md.
+model mandated by the project spec.
 
 **Relational Tier (Step 2.2).** An asynchronous ``aiosqlite`` engine
 compiling eight normalized tables: the four core tracking tables

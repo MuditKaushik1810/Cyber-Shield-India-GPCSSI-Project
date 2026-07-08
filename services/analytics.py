@@ -13,7 +13,7 @@ MAVI Score on the 0.00–100.00 scale from three weighted parameters:
   frequency shares weighted by per-vector danger coefficients.
 
 The module also carries the canonical **Mule Account Velocity Index**
-formula mandated by CLAUDE.md for money-mule hotspot identification:
+formula mandated by the project spec for money-mule hotspot identification:
 
     MAVI_velocity = (Σ V_in / ΔT_out) × log(1 + C_mule)
 
@@ -157,7 +157,7 @@ class AnalyticsResult(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Canonical Mule Account Velocity Index (CLAUDE.md formula).                  #
+# Canonical Mule Account Velocity Index (project-spec formula).                  #
 # --------------------------------------------------------------------------- #
 
 

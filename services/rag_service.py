@@ -80,7 +80,7 @@ LOGGER: logging.Logger = _build_logger()
 # Guardrail constants.                                                        #
 # --------------------------------------------------------------------------- #
 
-# CLAUDE.md RAG Integrity Guardrail — the unyielding fallback, verbatim.
+# RAG Integrity Guardrail — the unyielding fallback, verbatim.
 RAG_FALLBACK_MESSAGE: str = (
     "I am sorry, but I can only provide cyber safety protocols verified by "
     "official government sources."

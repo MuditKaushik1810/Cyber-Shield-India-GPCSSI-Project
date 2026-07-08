@@ -24,3 +24,6 @@ logs/
 
 # OS
 .DS_Store
+
+# Claude Code project-instructions file — keep local, do not publish
+CLAUDE.md

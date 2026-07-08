@@ -42,7 +42,7 @@ from bs4 import BeautifulSoup
 from bs4.element import Tag
 
 # --------------------------------------------------------------------------- #
-# Forensic logging — structured daily-rotating logs per CLAUDE.md mandate.    #
+# Forensic logging — structured daily-rotating logs per project mandate.    #
 # --------------------------------------------------------------------------- #
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
