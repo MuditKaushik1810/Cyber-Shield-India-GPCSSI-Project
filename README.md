@@ -10,8 +10,8 @@ An interactive, multi-modular **Cyber Awareness, OSINT Sandbox, and Digital Fore
 </p>
 
 <p align="center">
-  <img width="900" alt="Strategic Threat Analytics — geospatial crime hot-spots" src="https://github.com/user-attachments/assets/3b949952-e6d3-4ab5-b575-561c8ebc80dd" />
-  <br><sub><b>Strategic Threat Analytics — geospatial hot-spots & state-wise impact</b></sub>
+  <img width="900" alt="AI-powered CDR / IPDR Operational Analyser — schema-agnostic forensic breakdown" src="https://github.com/user-attachments/assets/3b949952-e6d3-4ab5-b575-561c8ebc80dd" />
+  <br><sub><b>CDR / IPDR Operational Analyser — schema-agnostic parsing with LLM forensic inference</b></sub>
 </p>
 
 <p align="center">
